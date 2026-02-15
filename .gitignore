@@ -1,0 +1,7 @@
+/target
+circuits/build/
+.claude
+target
+progress.md
+task_plan.md
+findings.md
