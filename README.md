@@ -22,13 +22,6 @@ CLIENT                                SERVER
 
 The server never sees the plaintext witness. Security relies on the Dual-LPN assumption.
 
-## Prerequisites
-
-- **Rust** (edition 2021)
-- **Circom 2.x** (for compiling `.circom` circuits)
-
-Install Circom: https://docs.circom.io/getting-started/installation/
-
 ## Quick start
 
 ### 1. Compile Circom circuits
@@ -103,15 +96,6 @@ circuits/
   range_check.circom        #   8-bit range proof
   compile.sh                #   Compile all .circom files
 ```
-
-## Key design choices
-
-- **BN254** as the pairing curve throughout
-- **EMSM is generic** over `CurveGroup` -- works for both G1 and G2 bases
-- **Independent LPN masks** for each of the 5 Groth16 MSMs (h, l, a, b_g1, b_g2)
-- **`client_encrypt` is generic** over `QAP: R1CSToQAP` -- use `LibsnarkReduction` for native R1CS circuits, `CircomReduction` for Circom circuits
-- **Rayon parallelism** for operations above 2^16 elements
-- **arkworks 0.5** ecosystem with `ark-circom 0.5` for Circom integration
 
 ## Using your own Circom circuit
 
