@@ -6,6 +6,13 @@ use serde::{Deserialize, Serialize};
 /// 2^24 elements is the largest LPN parameter table entry.
 const MAX_VEC_LEN: u64 = 1 << 24;
 
+/// Maximum number of elements pre-allocated before any element has decoded.
+/// The allocation for a `Vec<T>` is `count * size_of::<T>()`, so deriving the
+/// capacity from untrusted byte counts still amplifies attacker bytes by
+/// `size_of::<T>()` (~136x for G2Affine). Beyond this bound the Vec grows
+/// amortized, which is negligible next to element deserialization.
+const MAX_PREALLOC_ELEMS: usize = 1024;
+
 /// Serialize an arkworks type to bytes.
 pub fn ark_to_bytes<T: CanonicalSerialize>(val: &T) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -40,7 +47,16 @@ pub fn ark_vec_from_bytes<T: CanonicalDeserialize>(bytes: &[u8]) -> Result<Vec<T
     if len > MAX_VEC_LEN {
         anyhow::bail!("vec length {len} exceeds maximum {MAX_VEC_LEN}");
     }
-    let mut vals = Vec::with_capacity(len as usize);
+    // Do NOT pre-allocate based on untrusted input: the length prefix is
+    // attacker-controlled, and even the remaining byte count is a bad bound
+    // because the allocation is `count * size_of::<T>()` — for G2Affine that
+    // is ~136 bytes per *input byte*, letting a few-MB body force a
+    // hundreds-of-MB allocation before the first decode fails
+    // (memory-amplification DoS). Cap the initial capacity at a small constant
+    // and let the Vec grow amortized as elements actually decode; the growth
+    // cost is negligible next to point decompression.
+    let cap = (len as usize).min(cursor.len()).min(MAX_PREALLOC_ELEMS);
+    let mut vals = Vec::with_capacity(cap);
     for i in 0..len {
         let val = T::deserialize_compressed(&mut cursor)
             .map_err(|e| anyhow::anyhow!("failed to deserialize element {i}: {e}"))?;
@@ -109,6 +125,30 @@ mod tests {
     fn test_malformed_bytes_return_error() {
         let result: Result<Vec<Fr>, _> = ark_vec_from_bytes(&[0xff, 0xff]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_huge_length_prefix_tiny_body_does_not_overallocate() {
+        // Regression for an OOM found by the `vec_deser` fuzzer: a length prefix
+        // at the maximum (2^24) with an empty body must fail fast WITHOUT
+        // pre-allocating gigabytes. We assert it returns an error quickly; if the
+        // capacity were driven by `len` alone this would attempt a ~1.5 GB
+        // allocation for G2Affine.
+        let mut buf = Vec::new();
+        let huge_len: u64 = MAX_VEC_LEN; // within the cap, but no elements follow
+        ark_serialize::CanonicalSerialize::serialize_compressed(&huge_len, &mut buf).unwrap();
+        let r1: Result<Vec<Fr>, _> = ark_vec_from_bytes(&buf);
+        assert!(r1.is_err());
+        let r2: Result<Vec<G1Affine>, _> = ark_vec_from_bytes(&buf);
+        assert!(r2.is_err());
+
+        // Variant: a multi-KB junk body. Bounding the capacity by the remaining
+        // *byte* count alone would still allocate body_len * size_of::<T>()
+        // (~136x amplification for G2Affine); the MAX_PREALLOC_ELEMS cap keeps
+        // the upfront allocation constant regardless of body size.
+        buf.extend(std::iter::repeat(0xAAu8).take(64 * 1024));
+        let r3: Result<Vec<G1Affine>, _> = ark_vec_from_bytes(&buf);
+        assert!(r3.is_err());
     }
 
     #[test]

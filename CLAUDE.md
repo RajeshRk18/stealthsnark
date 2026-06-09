@@ -41,10 +41,23 @@ Rust implementation of "Single-Server Private Outsourcing of zk-SNARKs" (Abbasza
 - `PROGRESS.md` — log of completed work chunks
 
 ## Testing
-- `cargo test` — 25 tests (EMSM, Groth16 native + Circom, protocol)
+- `cargo test` — unit tests (EMSM, Groth16 native + Circom, protocol) + integration suites
+- **See `VERIFICATION.md`** for the full strategy. Verification suites in `tests/`:
+  - `differential.rs` — server-aided proof vs stock ark-groth16 (correctness oracle)
+  - `privacy.rs` — witness-hiding: noise-freshness guards + statistical indistinguishability
+  - `malicious_soundness.rs` — proptest tamper detection across all 10 MSM results
+  - `session_stress.rs` — concurrent multi-key session isolation
+- Fuzzing: `cargo +nightly fuzz run {vec_deser,message_parsing,malicious_response}`
+- Mutation testing: `cargo mutants` (scoped via `.cargo/mutants.toml`)
+- Benchmarks: `cargo bench` (criterion, `benches/msm_scaling.rs`)
 - Critical correctness: EMSM roundtrip, Groth16 proof verification
 - Circom tests skip gracefully if `circuits/build/` artifacts not found
 - Run `./circuits/compile.sh` before testing Circom circuits
+
+## Features
+- `circom` (default ON) — gates the ark-circom/wasmer integration and the `client` binary.
+  Build the lean core without wasmer via `--no-default-features` (required for cargo-fuzz,
+  whose sanitizer toolchain cannot compile wasmer).
 
 ## Build & Run
 ```sh

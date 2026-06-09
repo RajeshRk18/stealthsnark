@@ -1,0 +1,34 @@
+# cargo-mutants configuration.
+#
+# Mutation testing answers "do the tests actually catch a broken implementation?"
+# We focus it on the soundness- and privacy-critical core: a mutant that SURVIVES
+# in one of these files means the test suite has a blind spot in exactly the place
+# where a real bug is catastrophic (a forged proof, a leaked witness, an
+# undetected cheating server).
+#
+# Install:  cargo install cargo-mutants
+# Run:      cargo mutants            (uses this config)
+#           cargo mutants --file src/emsm/malicious.rs   (one file)
+
+examine_globs = [
+    "src/emsm/emsm.rs",          # encrypt / decrypt (mask removal formula)
+    "src/emsm/malicious.rs",     # consistency check — the soundness guard
+    "src/emsm/dual_lpn.rs",      # masking
+    "src/emsm/raa_code.rs",      # RAA code arithmetic
+    "src/emsm/pedersen.rs",      # MSM wrapper + length checks
+    "src/groth16/server_aided.rs", # proof assembly
+]
+
+# Lower-value / noisy targets: networking glue, binaries, the hardcoded param
+# table, and the circom path (needs external artifacts).
+exclude_globs = [
+    "src/bin/**",
+    "src/protocol/**",
+    "src/groth16/circom.rs",
+    "src/emsm/params.rs",
+]
+
+# Groth16 setup makes each test run a few seconds; give mutants headroom so a
+# slow-but-correct run isn't misreported as "caught by timeout".
+timeout_multiplier = 3.0
+minimum_test_timeout = 180

@@ -38,7 +38,7 @@ This compiles `multiplier2.circom` and `range_check.circom` into `circuits/build
 cargo test
 ```
 
-Runs 25 tests: EMSM primitives, Groth16 server-aided proving (native CubeCircuit + Circom circuits), protocol serialization.
+Runs the full suite: EMSM primitives, Groth16 server-aided proving (native CubeCircuit + Circom circuits), protocol serialization, plus the verification suites described in [Security hardening & verification](#security-hardening--verification) below.
 
 ### 3. Run client/server demo
 
@@ -55,6 +55,93 @@ cargo run --bin client
 ```
 
 The client performs Groth16 setup, sends generators to the server, masks the witness, delegates MSM computation, recovers the proof, and verifies it locally.
+
+## Security hardening & verification
+
+This is a cryptographic protocol where the dangerous failures are **silent**: a
+proof can verify while the system is actually unsound (accepts forged proofs) or
+leaking the witness. Ordinary happy-path tests don't catch those, so the project
+is verified in depth, with each layer resting on an *oracle independent of the
+code under test*. The full strategy lives in [`VERIFICATION.md`](VERIFICATION.md).
+
+### Threat model
+
+The **server is the adversary**. Two modes are implemented and tested:
+
+- **Semi-honest** — follows the protocol but tries to learn the witness.
+- **Malicious** — may also return wrong MSM results; defended by a double-query
+  consistency check that detects tampering with overwhelming probability.
+
+### Defense-in-depth layers
+
+| Property protected | Silent failure it catches | How it's verified | Independent oracle |
+|---|---|---|---|
+| **Completeness / correctness** | recovered proof doesn't verify | `tests/differential.rs` | stock `ark-groth16` prover+verifier |
+| **Witness privacy** | masked vectors leak the witness | `tests/privacy.rs` | self-calibrated statistical test |
+| **Soundness vs malicious server** | tampered response yields a verifying proof | `tests/malicious_soundness.rs` + `fuzz/malicious_response` | Groth16 verifier + exhaustive tamper |
+| **DoS / panic safety** | crash or OOM on malformed bytes | `fuzz/{vec_deser,message_parsing}` | libFuzzer |
+| **Session isolation** | one client's generators leak into another's proof | `tests/session_stress.rs` | per-key verify under concurrency |
+| **Test-suite adequacy** | tests pass even when the code is broken | `cargo mutants` | mutation testing |
+
+Concretely, beyond the original unit suite this added:
+
+- **Differential testing** — the server-aided proof (semi-honest *and*
+  malicious) must verify *exactly like* a proof from the unmodified `ark-groth16`
+  prover, across many witnesses, and must **fail** for a wrong public input.
+- **Privacy testing** — the witness-hiding guarantee the whole system exists for:
+  structural guards that the LPN noise is freshly re-sampled per MSM, per
+  main/check query, and per call (no noise reuse); that every witness coordinate
+  is actually masked; and a self-calibrated statistical test that the masked
+  output distribution is independent of the witness.
+- **Adversarial soundness testing** — every one of the ten MSM results is
+  tampered individually and in random combinations (200-case property test);
+  the consistency check must reject every one (random offsets bypass it only
+  with probability ~2⁻²⁵⁴, so the hard assert cannot flake).
+- **Fuzzing** (3 `cargo-fuzz` targets) — deserialization and the full
+  request-parsing pipeline must never panic/OOM; plus a soundness fuzzer that
+  hammers the malicious-response check.
+- **Mutation testing** — `cargo mutants`, scoped to the 296 mutation points in
+  the soundness-critical modules, proves the tests actually fail when the
+  implementation is broken.
+- **Benchmarks** — criterion tracks EMSM and proving cost to catch performance
+  regressions.
+
+### What this hardening caught
+
+These layers paid for themselves immediately — two real gaps, both fixed:
+
+1. **Memory-amplification DoS** (found by the `vec_deser` fuzzer on its first
+   run). Deserialization read a length prefix up to 2²⁴ and pre-allocated
+   `Vec::with_capacity(len)` before checking the body actually held that many
+   elements — a tiny request could force a ~0.5–1.5 GB allocation. Fixed by
+   capping the upfront allocation at a small constant (bounding by the remaining
+   *byte* count is not enough — the allocation is `count × size_of::<T>()`,
+   ~136× amplification for G2Affine), with a regression test, and confirmed by
+   replaying the crash artifact plus a clean 200k-run campaign.
+
+2. **Untested parallel code paths** (found by `cargo mutants`). 16 mutants
+   survived in the parallel branch of the RAA-code fold, because every test ran
+   below the 65536-element parallelism threshold — the rayon hot paths never
+   executed. Closed with three large-size tests that check each parallel path
+   (fold / suffix-sum / permute) against an independent sequential reference;
+   re-running confirms it (81/98 mutants caught, the rest provably equivalent),
+   and it surfaced a dead-code loop in the parallel suffix-sum that was removed.
+   The accumulator's suffix-sum semantics were cross-checked against the paper.
+
+See [`VERIFICATION.md`](VERIFICATION.md#findings) for details.
+
+### Running each layer
+
+```sh
+cargo test                                   # unit + integration + verification suites
+cargo +nightly fuzz run vec_deser            # also: message_parsing, malicious_response
+cargo mutants                                # mutation testing (scoped via .cargo/mutants.toml)
+cargo bench                                   # criterion performance benchmarks
+```
+
+Fuzzing requires the lean core without wasmer; the `fuzz/` crate already sets
+`default-features = false`. The `circom` feature (on by default) gates the
+`ark-circom`/wasmer integration and the `client` binary.
 
 ## Circuits
 
@@ -95,6 +182,21 @@ circuits/
   multiplier2.circom        #   a * b = c
   range_check.circom        #   8-bit range proof
   compile.sh                #   Compile all .circom files
+tests/                     # Verification suites (see VERIFICATION.md)
+  differential.rs           #   Server-aided proof vs stock ark-groth16
+  privacy.rs                #   Witness-hiding: noise freshness + statistical
+  malicious_soundness.rs    #   Adversarial tamper detection (proptest)
+  session_stress.rs         #   Concurrent session isolation
+  integration.rs            #   End-to-end HTTP flow
+fuzz/                      # cargo-fuzz targets
+  fuzz_targets/
+    vec_deser.rs            #   Deserialization never panics/OOMs
+    message_parsing.rs      #   Request-parse pipeline is panic-free
+    malicious_response.rs   #   Soundness fuzzer for the consistency check
+benches/
+  msm_scaling.rs            #   Criterion EMSM + proving benchmarks
+VERIFICATION.md            # Full verification strategy
+.cargo/mutants.toml        # cargo-mutants scope config
 ```
 
 ## Using your own Circom circuit

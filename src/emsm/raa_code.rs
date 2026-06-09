@@ -125,17 +125,9 @@ fn accumulate_inplace<F: Field>(v: &mut [F]) {
             })
             .collect();
 
-        // Phase 2: compute suffix sums of chunk totals
+        // Phase 2: exclusive suffix sums of the per-chunk totals.
+        // corrections[i] = sum of chunk_sums[i+1..]; corrections[last] = 0.
         let mut corrections = vec![F::zero(); num_chunks];
-        let mut running = F::zero();
-        for i in (0..chunk_sums.len()).rev() {
-            if i + 1 < chunk_sums.len() {
-                corrections[i] = running;
-            }
-            running += chunk_sums[i];
-        }
-        // corrections[0] should be sum of chunk_sums[1..], etc.
-        // Recalculate properly
         let mut suffix = F::zero();
         for i in (0..num_chunks).rev() {
             corrections[i] = suffix;
@@ -261,6 +253,55 @@ mod tests {
         assert_eq!(folded.len(), 2);
         assert_eq!(folded[0], Fr::from(10u64)); // 1+2+3+4
         assert_eq!(folded[1], Fr::from(26u64)); // 5+6+7+8
+    }
+
+    // The parallel branches of apply_f_fold / accumulate_inplace / permute_safe
+    // are gated behind PARALLEL_THRESHOLD, so all the small tests above only hit
+    // the sequential paths. These tests exercise the parallel paths at size
+    // >= PARALLEL_THRESHOLD against independent sequential references. (Found via
+    // cargo-mutants: 16 surviving mutants in apply_f_fold's parallel branch.)
+
+    #[test]
+    fn test_fold_parallel_path() {
+        // big_n = PARALLEL_THRESHOLD => fold n = N/4 >= PARALLEL_THRESHOLD/4 => parallel branch.
+        let len = PARALLEL_THRESHOLD;
+        let v: Vec<Fr> = (0..len).map(|j| Fr::from(j as u64)).collect();
+        let folded = apply_f_fold(&v);
+        assert_eq!(folded.len(), len / 4);
+        for i in 0..(len / 4) {
+            // (4i) + (4i+1) + (4i+2) + (4i+3) = 16i + 6
+            assert_eq!(folded[i], Fr::from(16u64 * i as u64 + 6), "fold mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn test_accumulate_parallel_matches_sequential_reference() {
+        let len = PARALLEL_THRESHOLD; // hits the parallel suffix-sum path
+        let vals: Vec<Fr> = (0..len).map(|j| Fr::from((j as u64 % 251) + 1)).collect();
+
+        // Independent reference: expected[i] = sum(vals[i..]).
+        let mut expected = vec![Fr::zero(); len];
+        let mut s = Fr::zero();
+        for i in (0..len).rev() {
+            s += vals[i];
+            expected[i] = s;
+        }
+
+        let mut v = vals.clone();
+        accumulate_inplace(&mut v);
+        assert_eq!(v, expected, "parallel suffix-sum disagrees with reference");
+    }
+
+    #[test]
+    fn test_permute_parallel_matches_reference() {
+        let len = PARALLEL_THRESHOLD; // hits the parallel permute path
+        let perm: Vec<usize> = (0..len).rev().collect(); // reversal permutation
+        let v: Vec<Fr> = (0..len).map(|j| Fr::from(j as u64)).collect();
+        let out = permute_safe(&v, &perm);
+        assert_eq!(out.len(), len);
+        for i in 0..len {
+            assert_eq!(out[i], v[perm[i]], "permute mismatch at {i}");
+        }
     }
 
     #[test]

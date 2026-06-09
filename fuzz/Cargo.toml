@@ -1,0 +1,52 @@
+[package]
+name = "stealthsnark-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Isolate the fuzz crate from the parent package (it is not a workspace member).
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+bincode = "1.3"
+rand = "0.8"
+rand_chacha = "0.3"
+ark-bn254 = "0.5"
+ark-ec = "0.5"
+ark-ff = "0.5"
+ark-groth16 = "0.5"
+ark-snark = "0.5"
+
+[dependencies.stealthsnark]
+path = ".."
+default-features = false  # exclude circom/wasmer (does not build under the fuzz sanitizer)
+
+# cargo-fuzz needs debug info in release for symbolized crash reports.
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "vec_deser"
+path = "fuzz_targets/vec_deser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message_parsing"
+path = "fuzz_targets/message_parsing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "malicious_response"
+path = "fuzz_targets/malicious_response.rs"
+test = false
+doc = false
+bench = false
