@@ -3,6 +3,12 @@ name = "stealthsnark"
 version = "0.1.0"
 edition = "2021"
 
+[lints.rust]
+# `kani` is set by the cargo-kani driver, not plain cargo. Declaring it here
+# keeps `#[cfg(kani)]` proof modules from tripping the unexpected-cfg lint on a
+# normal build. See src/emsm/raa_code.rs::kani_proofs.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [[bin]]
 name = "server"
 path = "src/bin/server.rs"

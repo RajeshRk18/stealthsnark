@@ -81,6 +81,7 @@ The **server is the adversary**. Two modes are implemented and tested:
 | **Soundness vs malicious server** | tampered response yields a verifying proof | `tests/malicious_soundness.rs` + `fuzz/malicious_response` | Groth16 verifier + exhaustive tamper |
 | **DoS / panic safety** | crash or OOM on malformed bytes | `fuzz/{vec_deser,message_parsing}` | libFuzzer |
 | **Session isolation** | one client's generators leak into another's proof | `tests/session_stress.rs` | per-key verify under concurrency |
+| **RAA kernel correctness** | a suffix-sum/fold/permute kernel is wrong on an untested input | `cargo kani` proofs in `src/emsm/raa_code.rs` | bounded model checking (CBMC) |
 | **Test-suite adequacy** | tests pass even when the code is broken | `cargo mutants` | mutation testing |
 
 Concretely, beyond the original unit suite this added:
@@ -103,6 +104,13 @@ Concretely, beyond the original unit suite this added:
 - **Mutation testing** — `cargo mutants`, scoped to the 296 mutation points in
   the soundness-critical modules, proves the tests actually fail when the
   implementation is broken.
+- **Formal verification** (`cargo kani`) — bounded model-checking proofs that the
+  RAA scalar kernels (suffix-sum chunking, 4:1 fold, permutation/inverse) are
+  correct for *all* inputs up to a small bound, not just the sampled sizes the
+  tests hit. This is targeted precisely where mutation testing showed the logic
+  was subtle. The kernels are proved over a tiny model monoid (wrapping `u64`)
+  that the checker can reason about symbolically; because they rely only on the
+  commutative-monoid laws, the results transfer to BN254's scalar field.
 - **Benchmarks** — criterion tracks EMSM and proving cost to catch performance
   regressions.
 
@@ -136,8 +144,13 @@ See [`VERIFICATION.md`](VERIFICATION.md#findings) for details.
 cargo test                                   # unit + integration + verification suites
 cargo +nightly fuzz run vec_deser            # also: message_parsing, malicious_response
 cargo mutants                                # mutation testing (scoped via .cargo/mutants.toml)
+cargo kani --no-default-features --lib       # formal proofs of the RAA kernels (CBMC)
 cargo bench                                   # criterion performance benchmarks
 ```
+
+`cargo kani` needs a one-time `cargo install --locked kani-verifier && cargo kani setup`.
+The `--no-default-features --lib` flags exclude the wasmer-backed `circom` path,
+which the model checker cannot compile.
 
 Fuzzing requires the lean core without wasmer; the `fuzz/` crate already sets
 `default-features = false`. The `circom` feature (on by default) gates the

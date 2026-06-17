@@ -23,6 +23,7 @@ The server is the adversary. Two modes are supported and tested:
 | **Soundness vs malicious server** | tampered response yields a verifying proof | `malicious_soundness.rs`, fuzz `malicious_response` | Groth16 verifier + exhaustive tamper |
 | **DoS / panic safety** | crash or OOM on malformed bytes | fuzz `vec_deser`, `message_parsing` | libFuzzer |
 | **Session isolation** | one session's generators leak into another | `session_stress.rs` | per-key verify under concurrency |
+| **RAA kernel correctness (all inputs ≤ bound)** | a suffix-sum / fold / permute kernel is wrong on an untested input | `cargo kani` proofs in `raa_code.rs` | bounded model checking (CBMC) |
 | **Test-suite adequacy** | tests pass even when code is broken | `cargo mutants` | mutation testing |
 
 ## Test layers & how to run them
@@ -92,6 +93,54 @@ Proves the tests above actually fail when the implementation is broken. A
 **surviving** mutant in `malicious.rs`, `emsm.rs`, or `server_aided.rs` is a real
 gap to close.
 
+### 5. Formal verification (`cargo kani`)
+
+```sh
+cargo install --locked kani-verifier && cargo kani setup   # one-time
+cargo kani --no-default-features --lib                      # run all proofs
+```
+
+Where do bounded proofs actually pay here? Not on the protocol math (proved on
+paper by the authors), not on field/curve arithmetic (trusted to `arkworks`, and
+intractable for a bit-blasting checker), and not on the witness-hiding property
+(probabilistic, not an assertion). They pay on the **RAA scalar kernels** — the
+suffix-sum chunking and 4:1 fold — which are pure, bounded, and exactly where
+mutation testing already showed the logic is subtle enough to hide dead code.
+Sampled-size tests check *specific* large inputs; these proofs check *all* inputs
+up to a small bound.
+
+The kernels are generic over a minimal `Additive` trait (identity, `+=`,
+is-zero). Production runs them on BN254's scalar field via a blanket
+`impl<F: Field> Additive for F`; the proofs run the **same** kernels on a tiny
+model type `Toy` = wrapping `u64` (the monoid ℤ/2⁶⁴) that CBMC can reason about
+symbolically. Because the kernels rely only on the commutative-monoid laws,
+every identity proved for `Toy` transfers to any field. The parallel (rayon)
+branches reduce to these same kernels; rayon only changes the execution order of
+independent per-chunk work, which is irrelevant to the (order-independent)
+result, so the sequential models faithfully cover them.
+
+Harnesses (in `raa_code.rs`, `#[cfg(kani)] mod kani_proofs`):
+
+| Harness | Proves |
+|---------|--------|
+| `exclusive_suffix_sums_matches_spec` | phase-2 corrections satisfy `corr[i] = Σ chunk_sums[i+1..]` (the step that hid dead code) |
+| `chunked_suffix_sum_equals_naive_cs{1,2,3,4}` | the full chunked suffix sum equals the naive reference, for every input; the four chunk sizes exhaust **every** chunking of a 4-element slice |
+| `accumulate_inplace_sequential_equals_naive` | the production entry point's sequential branch equals the naive reference |
+| `apply_f_fold_matches_spec` | fold yields `out[i] = Σ v[4i..4i+4]`; the `4i+k` indexing never goes out of bounds |
+| `permute_safe_in_bounds_is_correct` | with in-range indices, `permute_safe` never panics and yields `out[i] = v[perm[i]]` |
+| `inverse_permutation_inverts_valid_permutation` | for any valid permutation, `inverse_permutation` returns its true inverse and never panics |
+
+`--no-default-features --lib` is required so the wasmer-backed `circom` feature
+(and the feature-gated `client` binary) are excluded — CBMC cannot codegen
+wasmer, and the kernels don't need it.
+
+**Why not Kani on `messages.rs`?** `ark_vec_from_bytes` has a data-dependent
+loop bound (`0..len`, `len` up to 2²⁴), so the meaningful "no panic over all
+inputs" property is out of reach for a bounded checker, and the real DoS property
+is a *heap-allocation* bound CBMC doesn't model. That deserialization loop is
+better served by the `vec_deser` fuzzer (its actual oracle), which is why no Kani
+harness is added there.
+
 ## Findings
 
 - **Memory-amplification DoS in `ark_vec_from_bytes`** (found by the `vec_deser`
@@ -127,9 +176,12 @@ gap to close.
 
 ## Out of scope / future work
 
-- **Field & curve arithmetic** is trusted to `arkworks` (not re-verified here).
-  A bit-precise model checker (e.g. `kani`) could formally verify small pure
-  helpers (`pad_or_trim`, `MAX_VEC_LEN` bound, RAA fold) — a natural next step.
+- **Field & curve arithmetic** is trusted to `arkworks` (not re-verified here),
+  and is out of reach for a bit-blasting model checker anyway. The pure RAA
+  kernels that *are* tractable are now covered by `cargo kani` (see §5). The
+  protocol-level soundness/privacy theorems are proved on paper by the authors;
+  re-proving them in a proof assistant (Lean/Coq) over abstract groups is a
+  research effort, not a hardening step, and is deliberately not attempted.
 - **Constant-timeness** of masking is not asserted (the server only sees masked
   data; timing channels are out of the current model).
 - **Replay / freshness** protection at the protocol layer is intentionally left

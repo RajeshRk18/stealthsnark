@@ -49,6 +49,13 @@ Rust implementation of "Single-Server Private Outsourcing of zk-SNARKs" (Abbasza
   - `session_stress.rs` — concurrent multi-key session isolation
 - Fuzzing: `cargo +nightly fuzz run {vec_deser,message_parsing,malicious_response}`
 - Mutation testing: `cargo mutants` (scoped via `.cargo/mutants.toml`)
+- Formal verification: `cargo kani --no-default-features --lib` — bounded proofs
+  of the RAA kernels (suffix-sum chunking, fold, permutation) in
+  `src/emsm/raa_code.rs` (`#[cfg(kani)] mod kani_proofs`). Kernels are generic
+  over the `Additive` trait so proofs run on a model monoid (wrapping `u64`)
+  instead of BN254. Rayon branches are `#[cfg(not(kani))]`-gated (CBMC can't
+  model rayon); their logic is verified rayon-free via `chunked_model`.
+  `--no-default-features --lib` excludes the wasmer `circom` path / `client` bin.
 - Benchmarks: `cargo bench` (criterion, `benches/msm_scaling.rs`)
 - Critical correctness: EMSM roundtrip, Groth16 proof verification
 - Circom tests skip gracefully if `circuits/build/` artifacts not found
