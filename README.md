@@ -54,7 +54,57 @@ Terminal 2 -- run the client (Circom multiplier2: `a=3, b=11 -> c=33`):
 cargo run --bin client
 ```
 
-The client performs Groth16 setup, sends generators to the server, masks the witness, delegates MSM computation, recovers the proof, and verifies it locally.
+The client performs Groth16 setup, sends generators to the server, masks the witness, delegates MSM computation, recovers the proof, verifies it locally, then releases the session.
+
+## Running it as a service
+
+### HTTP API
+
+All request and response bodies are bincode over `application/octet-stream`.
+Every `/v1` request must carry `x-stealthsnark-version: 1`; errors come back as
+`{"code": "...", "message": "..."}` with a stable machine-readable `code`.
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `POST` | `/v1/setup` | none | Upload generators, receive a session token |
+| `POST` | `/v1/prove` | `Bearer <token>` | Evaluate the five MSMs |
+| `DELETE` | `/v1/session` | `Bearer <token>` | Release generators early |
+| `GET` | `/livez` | none | Process is up |
+| `GET` | `/readyz` | none | Process can accept work (503 when saturated or draining) |
+| `GET` | `/metrics` | none | Prometheus text format |
+
+The session token is **issued by the server** and is a bearer credential — do not
+log it. The server logs a separate short `session_label`, also returned to the
+client, so the two sides can correlate a request without the token reaching a log
+sink.
+
+### Configuration
+
+Everything is environment-driven; a malformed value fails startup rather than
+silently taking a default.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `STEALTHSNARK_BIND` | `127.0.0.1:3000` | Bind address. Loopback by default so an unauthenticated service is not exposed by accident. |
+| `STEALTHSNARK_MAX_BODY_BYTES` | `268435456` (256 MiB) | Largest request body. **This is what decides the largest servable circuit** — see below. |
+| `STEALTHSNARK_MAX_SESSIONS` | `64` | Cap on live sessions; each pins its generators in memory. |
+| `STEALTHSNARK_SESSION_TTL_SECS` | `1800` | Idle timeout before a session is evicted. |
+| `STEALTHSNARK_SWEEP_INTERVAL_SECS` | `60` | How often idle sessions are reclaimed. |
+| `STEALTHSNARK_MAX_CONCURRENT_MSM` | `cores/2`, clamped to `[1,4]` | Concurrent MSM evaluations. Small on purpose: each MSM is already rayon-parallel internally. |
+| `STEALTHSNARK_ADMISSION_WAIT_SECS` | `30` | How long a request waits for a slot before a 503. |
+| `STEALTHSNARK_REQUEST_TIMEOUT_SECS` | `600` | Per-request ceiling. |
+| `STEALTHSNARK_LOG` | `info` | `tracing` filter. |
+| `STEALTHSNARK_LOG_FORMAT` | text | Set to `json` for structured logs. |
+| `STEALTHSNARK_SERVER_URL` | `http://127.0.0.1:3000` | Client binary only. |
+
+**Sizing the body limit.** `/v1/setup` uploads every generator for all five MSMs
+in one body. A compressed G1 point is 32 bytes and a G2 point 64, so a circuit
+needing 2^20 generators per MSM is roughly 192 MiB. The body is buffered before
+decoding, so worst-case memory from in-flight bodies is about
+`MAX_BODY_BYTES * MAX_CONCURRENT_MSM` — the server logs that product at startup.
+
+Read `SECURITY.md` before exposing this to a network: it has no TLS and no client
+authentication by design, and expects to sit behind a reverse proxy.
 
 ## Security hardening & verification
 
@@ -186,10 +236,14 @@ src/
     server_aided.rs         #   ServerAidedProvingKey, client_encrypt/server_evaluate/client_decrypt
   protocol/
     messages.rs             #   Serde wrappers for arkworks serialization over HTTP
-    server.rs               #   Axum handlers: POST /setup, POST /prove
-    client.rs               #   Reqwest client: send_setup, send_prove
+    config.rs               #   Env-driven ServerConfig (limits, timeouts, TTL)
+    error.rs                #   ApiError -> status + stable machine-readable code
+    metrics.rs              #   Prometheus counters (incl. cheating-server counter)
+    session.rs              #   Token-keyed session store: TTL, cap, prebuilt keys
+    server.rs               #   Axum handlers, admission control, health, shutdown
+    client.rs               #   Reqwest client: setup / prove / release, timeouts
   bin/
-    server.rs               #   Server binary (listens on :3000)
+    server.rs               #   Server binary (config + graceful shutdown)
     client.rs               #   Client binary (Circom multiplier2 end-to-end)
 circuits/
   multiplier2.circom        #   a * b = c
@@ -200,7 +254,9 @@ tests/                     # Verification suites (see VERIFICATION.md)
   privacy.rs                #   Witness-hiding: noise freshness + statistical
   malicious_soundness.rs    #   Adversarial tamper detection (proptest)
   session_stress.rs         #   Concurrent session isolation
+  service_hardening.rs      #   Body limits, session auth, TTL, versioning, health
   integration.rs            #   End-to-end HTTP flow
+  common/mod.rs             #   Shared harness for the HTTP suites
 fuzz/                      # cargo-fuzz targets
   fuzz_targets/
     vec_deser.rs            #   Deserialization never panics/OOMs
@@ -209,6 +265,7 @@ fuzz/                      # cargo-fuzz targets
 benches/
   msm_scaling.rs            #   Criterion EMSM + proving benchmarks
 VERIFICATION.md            # Full verification strategy
+SECURITY.md                # Disclosure policy + scope / non-goals
 .cargo/mutants.toml        # cargo-mutants scope config
 ```
 

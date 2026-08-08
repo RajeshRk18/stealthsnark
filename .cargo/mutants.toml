@@ -17,13 +17,22 @@ examine_globs = [
     "src/emsm/raa_code.rs",      # RAA code arithmetic
     "src/emsm/pedersen.rs",      # MSM wrapper + length checks
     "src/groth16/server_aided.rs", # proof assembly
+    # Session bookkeeping is a security boundary, not glue: a surviving mutant
+    # here means the tests would not notice a session becoming shareable,
+    # unexpirable, or uncapped.
+    "src/protocol/session.rs",
 ]
 
 # Lower-value / noisy targets: networking glue, binaries, the hardcoded param
 # table, and the circom path (needs external artifacts).
 exclude_globs = [
     "src/bin/**",
-    "src/protocol/**",
+    "src/protocol/client.rs",
+    "src/protocol/config.rs",
+    "src/protocol/error.rs",
+    "src/protocol/messages.rs",
+    "src/protocol/metrics.rs",
+    "src/protocol/server.rs",
     "src/groth16/circom.rs",
     "src/emsm/params.rs",
 ]

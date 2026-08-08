@@ -10,7 +10,16 @@ Rust implementation of "Single-Server Private Outsourcing of zk-SNARKs" (Abbasza
   - Malicious-secure: `malicious_client_encrypt` / `malicious_server_evaluate_groth16` / `malicious_client_decrypt` (double-query consistency check per MSM)
 - **Circom Integration**: `src/groth16/circom.rs` loads Circom circuits via ark-circom 0.5
 - **Protocol**: HTTP client-server (axum + reqwest) in `src/protocol/` and `src/bin/`
-  - Session-bound: each client gets a session ID; /setup and /prove are scoped per session
+  - Versioned endpoints: `POST /v1/setup`, `POST /v1/prove`, `DELETE /v1/session`,
+    plus `/livez`, `/readyz`, `/metrics`. Every `/v1` request must carry
+    `x-stealthsnark-version: 1` (bincode is not self-describing, so a shape
+    change would otherwise decode as garbage instead of failing)
+  - **Sessions are server-issued**: `/v1/setup` returns a 256-bit bearer token.
+    Clients never choose a session id. The token is a secret — log the
+    accompanying non-secret `session_label` instead
+  - Sessions have an idle TTL, a count cap, and an explicit release endpoint
+  - `config.rs` (env-driven limits/timeouts), `error.rs` (`ApiError` → status +
+    stable machine code), `metrics.rs` (Prometheus), `session.rs` (token store)
   - All deserialization is fallible with MAX_VEC_LEN cap (no panics on untrusted input)
 - **Circuits**: sample Circom circuits in `circuits/`, compiled artifacts in `circuits/build/` (gitignored)
 - Reference implementation: https://github.com/h-hafezi/server-aided-snarks (arkworks 0.4, library-only, no networking)
@@ -29,8 +38,16 @@ Rust implementation of "Single-Server Private Outsourcing of zk-SNARKs" (Abbasza
 - `client_encrypt` is generic over `QAP: R1CSToQAP` — use `LibsnarkReduction` for native circuits, `CircomReduction` for Circom circuits
 - Parallel ops via rayon above threshold (2^16 elements)
 - CanonicalSerialize/CanonicalDeserialize for arkworks types -> Vec<u8> -> serde wrappers for HTTP
-- All deserialization is fallible (`Result` return types) — never panic on untrusted input
+- All serialization *and* deserialization is fallible (`Result` return types) —
+  never panic on a request path. `ark_to_bytes` / `ark_vec_to_bytes` return
+  `Result`; prefer `SetupRequest::encode` / `ProveRequest::encode`, which handle
+  the five-field repetition in one place
 - `Pedersen::commit` returns `Result<G, PedersenError>` — propagate, don't unwrap
+- **No CPU work on the async runtime.** Point deserialization (subgroup checks)
+  and MSM evaluation both belong inside `tokio::task::spawn_blocking`. Never hold
+  a lock across either — clone the `Arc<Session>` out and release
+- Server config comes from the environment via `ServerConfig::from_env`; a
+  malformed value fails startup rather than silently defaulting
 - ark-circom returns `eyre::Report` errors; map to anyhow via `.map_err(|e| anyhow::anyhow!("{e}"))`
 - Circom tests need `#[tokio::test]` (wasmer's virtual-fs requires a tokio reactor)
 - Binaries use `OsRng` for cryptographic randomness; `seed_from_u64` only in tests
@@ -47,6 +64,13 @@ Rust implementation of "Single-Server Private Outsourcing of zk-SNARKs" (Abbasza
   - `privacy.rs` — witness-hiding: noise-freshness guards + statistical indistinguishability
   - `malicious_soundness.rs` — proptest tamper detection across all 10 MSM results
   - `session_stress.rs` — concurrent multi-key session isolation
+  - `service_hardening.rs` — service-layer properties no crypto test can see:
+    body limits, session-token auth, TTL eviction, session cap, version
+    enforcement, distinguishable error codes, health/metrics
+  - `common/mod.rs` — shared harness for the HTTP suites (not a test target)
+- **Use a realistic payload size somewhere.** Every crypto suite uses a toy
+  circuit, which is exactly how axum's default 2 MiB body limit went unnoticed
+  while silently rejecting every circuit worth outsourcing
 - Fuzzing: `cargo +nightly fuzz run {vec_deser,message_parsing,malicious_response}`
 - Mutation testing: `cargo mutants` (scoped via `.cargo/mutants.toml`)
 - Formal verification: `cargo kani --no-default-features --lib` — bounded proofs

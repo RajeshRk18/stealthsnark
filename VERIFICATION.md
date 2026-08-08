@@ -23,6 +23,10 @@ The server is the adversary. Two modes are supported and tested:
 | **Soundness vs malicious server** | tampered response yields a verifying proof | `malicious_soundness.rs`, fuzz `malicious_response` | Groth16 verifier + exhaustive tamper |
 | **DoS / panic safety** | crash or OOM on malformed bytes | fuzz `vec_deser`, `message_parsing` | libFuzzer |
 | **Session isolation** | one session's generators leak into another | `session_stress.rs` | per-key verify under concurrency |
+| **Session authenticity** | a client acts on a session it was not issued | `service_hardening.rs`, `session.rs` unit tests | server-issued 256-bit tokens |
+| **Servable circuit size** | the transport silently rejects every useful circuit | `service_hardening.rs` | payload above the old 2 MiB ceiling |
+| **Bounded memory** | abandoned sessions pin generators forever | `service_hardening.rs`, `session.rs` unit tests | TTL eviction + session cap |
+| **Diagnosability** | distinct failures are indistinguishable to a client | `service_hardening.rs` | stable machine-readable error codes |
 | **RAA kernel correctness (all inputs ≤ bound)** | a suffix-sum / fold / permute kernel is wrong on an untested input | `cargo kani` proofs in `raa_code.rs` | bounded model checking (CBMC) |
 | **Test-suite adequacy** | tests pass even when code is broken | `cargo mutants` | mutation testing |
 
@@ -56,7 +60,31 @@ Integration suites (in `tests/`):
   tolerate detection regressions (a `_ck`-only tamper never enters proof
   assembly, so a broken check would still hand back a verifying proof).
 - **`session_stress.rs`** — many concurrent clients across two distinct keys;
-  cross-session generator clobbering would surface as a verify failure.
+  cross-session generator clobbering would surface as a verify failure. Also
+  asserts that forged bearer tokens are refused with 401 under concurrency.
+- **`service_hardening.rs`** — the service-layer properties that no
+  cryptographic test can observe, because every crypto suite uses a toy circuit:
+
+  | Test | Property |
+  |---|---|
+  | `setup_accepts_payload_above_the_old_2mib_ceiling` | a >2 MiB generator upload succeeds |
+  | `setup_rejects_payload_above_configured_limit` | the cap is real and yields a clean 413 |
+  | `forged_and_missing_tokens_are_refused` | no credential / a forged one ⇒ 401 |
+  | `concurrent_setups_do_not_clobber_each_other` | independent tokens, no replacement |
+  | `expired_sessions_are_refused_and_freed` | idle TTL stops resolving and frees memory |
+  | `session_cap_is_enforced` | 429 + `Retry-After`, map does not grow |
+  | `version_header_is_required_and_enforced` | absent/wrong version ⇒ 400 |
+  | `failure_modes_are_distinguishable` | `malformed_body` ≠ `invalid_input` |
+  | `length_mismatch_is_reported_as_invalid_input` | bad request does not kill the session |
+  | `release_frees_the_session_and_invalidates_the_token` | explicit teardown works, double release ⇒ 401 |
+  | `health_endpoints_are_unauthenticated_and_unversioned` | probes need no protocol knowledge |
+  | `metrics_reflect_traffic` | counters move, incl. the cheating-server counter |
+
+  The first of these is the one worth dwelling on. Five verification layers —
+  differential, privacy, proptest soundness, fuzzing, Kani — all passed while
+  axum's default 2 MiB body limit made the service unable to accept any circuit
+  large enough to be worth outsourcing. Correctness oracles cannot see a
+  capacity ceiling; only a realistically-sized payload can.
 
 ### 2. Benchmarks (`cargo bench`)
 
