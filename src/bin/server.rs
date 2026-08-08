@@ -1,19 +1,43 @@
-use std::sync::Arc;
-use tokio::sync::RwLock;
+//! EMSM server binary.
+//!
+//! Thin wrapper: read configuration from the environment, validate it, hand off
+//! to [`stealthsnark::protocol::server::serve`], which owns binding, the session
+//! sweeper, and graceful shutdown.
 
-use stealthsnark::protocol::server::{create_router, ServerState};
+use stealthsnark::protocol::config::ServerConfig;
+use stealthsnark::protocol::server::{serve, AppState};
 
 #[tokio::main]
-async fn main() {
-    tracing_subscriber::fmt::init();
+async fn main() -> anyhow::Result<()> {
+    init_tracing();
 
-    let state = Arc::new(RwLock::new(ServerState::new()));
-    let app = create_router(state);
+    // A bad env var fails startup here rather than surfacing later as odd
+    // behaviour under load.
+    let config = ServerConfig::from_env()?;
+    config.validate()?;
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
-        .await
-        .expect("failed to bind to port 3000");
+    // `?` rather than `.expect()`: a port clash should print one clear line, not
+    // a panic backtrace.
+    serve(AppState::new(config)).await
+}
 
-    tracing::info!("StealthSnark server listening on :3000");
-    axum::serve(listener, app).await.expect("server error");
+/// JSON logs when `STEALTHSNARK_LOG_FORMAT=json`, human-readable otherwise.
+///
+/// Structured output matters because the handlers emit tracing *fields*
+/// (`session`, `elapsed_ms`, `resident_mib`) rather than interpolating values
+/// into the message. Fields are queryable; interpolated strings are not.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("STEALTHSNARK_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    let json = std::env::var("STEALTHSNARK_LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    if json {
+        builder.json().init();
+    } else {
+        builder.init();
+    }
 }

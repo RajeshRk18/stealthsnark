@@ -1,3 +1,6 @@
+//! Demo client: proves a Circom `multiplier2` circuit through the server-aided
+//! Groth16 protocol and verifies the resulting proof locally.
+
 use ark_bn254::{Bn254, G1Affine, G2Affine};
 use ark_circom::CircomReduction;
 use ark_groth16::Groth16;
@@ -11,17 +14,18 @@ use stealthsnark::protocol::messages::*;
 
 const MULTIPLIER2_WASM: &str = "circuits/build/multiplier2_js/multiplier2.wasm";
 const MULTIPLIER2_R1CS: &str = "circuits/build/multiplier2.r1cs";
+const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:3000";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let mut rng = OsRng;
-    let server_url = "http://127.0.0.1:3000";
-    let session_id = format!("{:016x}", rand::random::<u64>());
+    let server_url =
+        std::env::var("STEALTHSNARK_SERVER_URL").unwrap_or_else(|_| DEFAULT_SERVER_URL.to_string());
 
     println!("=== StealthSnark Client (Circom multiplier2) ===");
-    println!("Session: {session_id}");
+    println!("Server: {server_url}");
 
     // Step 1: Groth16 setup with Circom circuit
     println!("[1/6] Running Groth16 trusted setup (Circom multiplier2)...");
@@ -31,17 +35,22 @@ async fn main() -> anyhow::Result<()> {
     println!("[2/6] Creating server-aided proving key (EMSM preprocessing)...");
     let sapk = ServerAidedProvingKey::setup(pk, &mut rng);
 
-    // Step 3: Send generators to server
+    // Step 3: Send generators to server. The session token comes back from the
+    // server; the client does not pick its own identifier.
     println!("[3/6] Sending generators to server...");
-    let http_client = EmsmClient::new(server_url, session_id);
-    let setup_request = SetupRequest {
-        h_generators: ark_vec_to_bytes(&sapk.emsm_h.generators),
-        l_generators: ark_vec_to_bytes(&sapk.emsm_l.generators),
-        a_generators: ark_vec_to_bytes(&sapk.emsm_a.generators),
-        b_g1_generators: ark_vec_to_bytes(&sapk.emsm_b_g1.generators),
-        b_g2_generators: ark_vec_to_bytes::<G2Affine>(&sapk.emsm_b_g2.generators),
-    };
+    let mut http_client = EmsmClient::new(&server_url)?;
+    let setup_request = SetupRequest::encode::<G1Affine, G2Affine>(
+        &sapk.emsm_h.generators,
+        &sapk.emsm_l.generators,
+        &sapk.emsm_a.generators,
+        &sapk.emsm_b_g1.generators,
+        &sapk.emsm_b_g2.generators,
+    )?;
     http_client.send_setup(&setup_request).await?;
+    println!(
+        "      session established (label {})",
+        http_client.session_label().unwrap_or("?")
+    );
 
     // Step 4: Build Circom circuit and encrypt
     println!("[4/6] Building Circom circuit (a=3, b=11) and encrypting...");
@@ -55,13 +64,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Step 5: Send masked vectors to server, receive MSM results
     println!("[5/6] Delegating MSM computation to server...");
-    let prove_request = ProveRequest {
-        v_h: ark_vec_to_bytes(&request.v_h),
-        v_l: ark_vec_to_bytes(&request.v_l),
-        v_a: ark_vec_to_bytes(&request.v_a),
-        v_b_g1: ark_vec_to_bytes(&request.v_b_g1),
-        v_b_g2: ark_vec_to_bytes(&request.v_b_g2),
-    };
+    let prove_request = ProveRequest::encode(
+        &request.v_h,
+        &request.v_l,
+        &request.v_a,
+        &request.v_b_g1,
+        &request.v_b_g2,
+    )?;
     let prove_response = http_client.send_prove(&prove_request).await?;
 
     // Decode server response back to group elements
@@ -76,14 +85,20 @@ async fn main() -> anyhow::Result<()> {
     // Step 6: Decrypt and verify
     println!("[6/6] Decrypting proof and verifying...");
     let proof = client_decrypt(&sapk, &server_response, &state);
-
     let valid = Groth16::<Bn254, CircomReduction>::verify(&vk, &public_inputs, &proof)?;
+
+    // Free the server's copy of the generators rather than leaving them pinned
+    // until the idle TTL expires. Best-effort: a failure here does not
+    // invalidate a proof we already verified.
+    if let Err(e) = http_client.release().await {
+        tracing::warn!(error = %e, "failed to release session; it will expire on its own");
+    }
 
     if valid {
         println!("SUCCESS: Server-aided Groth16 proof verified! (3 * 11 = 33)");
+        Ok(())
     } else {
-        println!("FAILURE: Proof verification failed!");
+        // Exit non-zero so a scripted caller notices.
+        anyhow::bail!("proof verification failed")
     }
-
-    Ok(())
 }

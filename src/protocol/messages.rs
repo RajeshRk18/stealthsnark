@@ -1,9 +1,24 @@
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use serde::{Deserialize, Serialize};
 
+/// Wire protocol version, sent in the [`VERSION_HEADER`] on every `/v1` request.
+///
+/// bincode is not self-describing: if a message struct gains a field, an older
+/// peer decodes the bytes as *something* rather than failing. An explicit version
+/// turns that silent corruption into a clean rejection. Bump this whenever any
+/// type in this module changes shape.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Header carrying [`PROTOCOL_VERSION`].
+pub const VERSION_HEADER: &str = "x-stealthsnark-version";
+
 /// Maximum number of elements allowed in a deserialized vector.
 /// Prevents unbounded allocation from attacker-controlled length prefixes.
 /// 2^24 elements is the largest LPN parameter table entry.
+///
+/// Note this is a *structural* bound, not the effective one: a request also has
+/// to fit under [`crate::protocol::config::ServerConfig::max_body_bytes`], which
+/// is what actually decides the largest servable circuit.
 const MAX_VEC_LEN: u64 = 1 << 24;
 
 /// Maximum number of elements pre-allocated before any element has decoded.
@@ -14,11 +29,15 @@ const MAX_VEC_LEN: u64 = 1 << 24;
 const MAX_PREALLOC_ELEMS: usize = 1024;
 
 /// Serialize an arkworks type to bytes.
-pub fn ark_to_bytes<T: CanonicalSerialize>(val: &T) -> Vec<u8> {
+///
+/// Fallible for the same reason the deserializers are: this runs on the server's
+/// response path, and a library function that aborts the process on an
+/// unexpected input is the wrong failure mode even when the input is our own.
+pub fn ark_to_bytes<T: CanonicalSerialize>(val: &T) -> Result<Vec<u8>, anyhow::Error> {
     let mut buf = Vec::new();
     val.serialize_compressed(&mut buf)
-        .expect("serialization failed");
-    buf
+        .map_err(|e| anyhow::anyhow!("serialization failed: {e}"))?;
+    Ok(buf)
 }
 
 /// Deserialize an arkworks type from bytes.
@@ -28,14 +47,18 @@ pub fn ark_from_bytes<T: CanonicalDeserialize>(bytes: &[u8]) -> Result<T, anyhow
 }
 
 /// Serialize a vector of arkworks types to bytes.
-pub fn ark_vec_to_bytes<T: CanonicalSerialize>(vals: &[T]) -> Vec<u8> {
+///
+/// Fallible for the same reason as [`ark_to_bytes`].
+pub fn ark_vec_to_bytes<T: CanonicalSerialize>(vals: &[T]) -> Result<Vec<u8>, anyhow::Error> {
     let mut buf = Vec::new();
     let len = vals.len() as u64;
-    len.serialize_compressed(&mut buf).unwrap();
-    for v in vals {
-        v.serialize_compressed(&mut buf).unwrap();
+    len.serialize_compressed(&mut buf)
+        .map_err(|e| anyhow::anyhow!("failed to write vec length: {e}"))?;
+    for (i, v) in vals.iter().enumerate() {
+        v.serialize_compressed(&mut buf)
+            .map_err(|e| anyhow::anyhow!("failed to serialize element {i}: {e}"))?;
     }
-    buf
+    Ok(buf)
 }
 
 /// Deserialize a vector of arkworks types from bytes.
@@ -65,8 +88,24 @@ pub fn ark_vec_from_bytes<T: CanonicalDeserialize>(bytes: &[u8]) -> Result<Vec<T
     Ok(vals)
 }
 
+/// Setup response: the server-issued session credential.
+///
+/// The client does not choose its session identifier. When it did, a second
+/// `/setup` reusing an id silently replaced the first client's generators, so
+/// anyone who could guess or observe an id could make a victim's `/prove` run
+/// against attacker-supplied bases.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SetupResponse {
+    /// Bearer credential for `/v1/prove` and `/v1/session`. Treat as a secret:
+    /// do not log it, and do not persist it beyond the session.
+    pub session_token: String,
+    /// Short non-secret id that the server also logs, so a client and an operator
+    /// can correlate a request without the token ever reaching a log sink.
+    pub session_label: String,
+}
+
 /// Setup request: generator points for each of the 5 MSMs.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SetupRequest {
     pub h_generators: Vec<u8>,
     pub l_generators: Vec<u8>,
@@ -75,8 +114,34 @@ pub struct SetupRequest {
     pub b_g2_generators: Vec<u8>,
 }
 
+impl SetupRequest {
+    /// Encode the five generator sets.
+    ///
+    /// Exists so that the fallibility introduced by [`ark_vec_to_bytes`] is
+    /// handled once here rather than five times at every call site.
+    pub fn encode<P1, P2>(
+        h: &[P1],
+        l: &[P1],
+        a: &[P1],
+        b_g1: &[P1],
+        b_g2: &[P2],
+    ) -> Result<Self, anyhow::Error>
+    where
+        P1: CanonicalSerialize,
+        P2: CanonicalSerialize,
+    {
+        Ok(Self {
+            h_generators: ark_vec_to_bytes(h)?,
+            l_generators: ark_vec_to_bytes(l)?,
+            a_generators: ark_vec_to_bytes(a)?,
+            b_g1_generators: ark_vec_to_bytes(b_g1)?,
+            b_g2_generators: ark_vec_to_bytes(b_g2)?,
+        })
+    }
+}
+
 /// Prove request: 5 masked scalar vectors.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ProveRequest {
     pub v_h: Vec<u8>,
     pub v_l: Vec<u8>,
@@ -85,8 +150,27 @@ pub struct ProveRequest {
     pub v_b_g2: Vec<u8>,
 }
 
+impl ProveRequest {
+    /// Encode the five masked scalar vectors.
+    pub fn encode<F: CanonicalSerialize>(
+        v_h: &[F],
+        v_l: &[F],
+        v_a: &[F],
+        v_b_g1: &[F],
+        v_b_g2: &[F],
+    ) -> Result<Self, anyhow::Error> {
+        Ok(Self {
+            v_h: ark_vec_to_bytes(v_h)?,
+            v_l: ark_vec_to_bytes(v_l)?,
+            v_a: ark_vec_to_bytes(v_a)?,
+            v_b_g1: ark_vec_to_bytes(v_b_g1)?,
+            v_b_g2: ark_vec_to_bytes(v_b_g2)?,
+        })
+    }
+}
+
 /// Prove response: 5 MSM results (group elements).
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ProveResponse {
     pub em_h: Vec<u8>,
     pub em_l: Vec<u8>,
@@ -107,7 +191,7 @@ mod tests {
     fn test_scalar_roundtrip() {
         let mut rng = test_rng();
         let scalars: Vec<Fr> = (0..10).map(|_| Fr::rand(&mut rng)).collect();
-        let bytes = ark_vec_to_bytes(&scalars);
+        let bytes = ark_vec_to_bytes(&scalars).unwrap();
         let recovered: Vec<Fr> = ark_vec_from_bytes(&bytes).unwrap();
         assert_eq!(scalars, recovered);
     }
@@ -116,7 +200,7 @@ mod tests {
     fn test_point_roundtrip() {
         let mut rng = test_rng();
         let points: Vec<G1Affine> = (0..5).map(|_| G1::rand(&mut rng).into_affine()).collect();
-        let bytes = ark_vec_to_bytes(&points);
+        let bytes = ark_vec_to_bytes(&points).unwrap();
         let recovered: Vec<G1Affine> = ark_vec_from_bytes(&bytes).unwrap();
         assert_eq!(points, recovered);
     }

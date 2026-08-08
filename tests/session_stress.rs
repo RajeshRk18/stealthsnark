@@ -1,8 +1,7 @@
 //! Concurrency stress test for per-session isolation.
 //!
-//! The server stores each client's generators in a `RwLock<HashMap>` keyed by
-//! session id. The existing integration test checks isolation sequentially; this
-//! test hammers `/setup` and `/prove` from many concurrent clients to surface
+//! The server stores each client's generators in a token-keyed map. This test
+//! hammers `/v1/setup` and `/v1/prove` from many concurrent clients to surface
 //! races and cross-session clobbering (a "selective failure" where one session's
 //! generators leak into another's proving).
 //!
@@ -12,64 +11,22 @@
 //! that chose different setups, that session's proof fails to verify and the
 //! test fails.
 
+mod common;
+
 use std::sync::Arc;
 
-use ark_bn254::{Bn254, Fr, G1Affine, G2Affine};
+use ark_bn254::{Bn254, Fr};
 use ark_groth16::r1cs_to_qap::LibsnarkReduction;
 use ark_groth16::{Groth16, VerifyingKey};
 use ark_snark::SNARK;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
-use tokio::sync::RwLock;
 
+use common::{decode_response, prove_request, setup_request, spawn_server_with};
 use stealthsnark::groth16::circuit::CubeCircuit;
-use stealthsnark::groth16::server_aided::{
-    client_decrypt, client_encrypt, ServerAidedProvingKey, ServerResponse,
-};
+use stealthsnark::groth16::server_aided::{client_decrypt, client_encrypt, ServerAidedProvingKey};
 use stealthsnark::protocol::client::EmsmClient;
-use stealthsnark::protocol::messages::*;
-use stealthsnark::protocol::server::{create_router, ServerState};
-
-fn setup_request(sapk: &ServerAidedProvingKey) -> SetupRequest {
-    SetupRequest {
-        h_generators: ark_vec_to_bytes(&sapk.emsm_h.generators),
-        l_generators: ark_vec_to_bytes(&sapk.emsm_l.generators),
-        a_generators: ark_vec_to_bytes(&sapk.emsm_a.generators),
-        b_g1_generators: ark_vec_to_bytes(&sapk.emsm_b_g1.generators),
-        b_g2_generators: ark_vec_to_bytes::<G2Affine>(&sapk.emsm_b_g2.generators),
-    }
-}
-
-fn prove_request(req: &stealthsnark::groth16::server_aided::EncryptedRequest) -> ProveRequest {
-    ProveRequest {
-        v_h: ark_vec_to_bytes(&req.v_h),
-        v_l: ark_vec_to_bytes(&req.v_l),
-        v_a: ark_vec_to_bytes(&req.v_a),
-        v_b_g1: ark_vec_to_bytes(&req.v_b_g1),
-        v_b_g2: ark_vec_to_bytes(&req.v_b_g2),
-    }
-}
-
-fn decode_response(pr: &ProveResponse) -> ServerResponse {
-    ServerResponse {
-        em_h: ark_from_bytes::<G1Affine>(&pr.em_h).unwrap().into(),
-        em_l: ark_from_bytes::<G1Affine>(&pr.em_l).unwrap().into(),
-        em_a: ark_from_bytes::<G1Affine>(&pr.em_a).unwrap().into(),
-        em_b_g1: ark_from_bytes::<G1Affine>(&pr.em_b_g1).unwrap().into(),
-        em_b_g2: ark_from_bytes::<G2Affine>(&pr.em_b_g2).unwrap().into(),
-    }
-}
-
-async fn spawn_server() -> String {
-    let state = Arc::new(RwLock::new(ServerState::new()));
-    let app = create_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    format!("http://{addr}")
-}
+use stealthsnark::protocol::config::ServerConfig;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_sessions_stay_isolated() {
@@ -87,18 +44,24 @@ async fn concurrent_sessions_stay_isolated() {
     }
     let setups = Arc::new(setups);
 
-    let server_url = spawn_server().await;
-
-    // Fan out many concurrent honest sessions, round-robined across the two keys.
     const SESSIONS: usize = 24;
+
+    // Headroom above the session count so the cap is not what this test measures,
+    // and enough MSM slots that admission control does not serialise everything.
+    let cfg = ServerConfig {
+        max_sessions: SESSIONS * 2,
+        max_concurrent_msm: 4,
+        ..ServerConfig::default()
+    };
+    let (server_url, state) = spawn_server_with(cfg).await;
+
     let mut handles = Vec::new();
     for i in 0..SESSIONS {
         let setups = setups.clone();
         let url = server_url.clone();
         handles.push(tokio::spawn(async move {
             let (sapk, vk) = &setups[i % setups.len()];
-            let session_id = format!("sess-{i}");
-            let client = EmsmClient::new(&url, session_id);
+            let mut client = EmsmClient::new(&url).map_err(|e| format!("client: {e}"))?;
 
             client
                 .send_setup(&setup_request(sapk))
@@ -110,7 +73,7 @@ async fn concurrent_sessions_stay_isolated() {
             let circuit = CubeCircuit {
                 x: Some(Fr::from(3u64)),
             };
-            let (req, state) =
+            let (req, enc_state) =
                 client_encrypt::<LibsnarkReduction, _, _>(sapk.as_ref(), circuit, &mut local_rng)
                     .map_err(|e| format!("encrypt: {e}"))?;
 
@@ -118,43 +81,70 @@ async fn concurrent_sessions_stay_isolated() {
                 .send_prove(&prove_request(&req))
                 .await
                 .map_err(|e| format!("prove: {e}"))?;
-            let proof = client_decrypt(sapk.as_ref(), &decode_response(&resp), &state);
+            let proof = client_decrypt(sapk.as_ref(), &decode_response(&resp), &enc_state);
 
             if !Groth16::<Bn254>::verify(vk, &[Fr::from(35u64)], &proof).unwrap() {
                 return Err(format!(
                     "session {i} proof failed to verify (possible cross-session clobber)"
                 ));
             }
+
+            client
+                .release()
+                .await
+                .map_err(|e| format!("release: {e}"))?;
             Ok::<(), String>(())
         }));
     }
 
-    // Concurrently, sessions that never ran /setup must be refused.
-    let mut unknown_handles = Vec::new();
+    // Concurrently, forged tokens must be refused.
+    let mut forged_handles = Vec::new();
     for i in 0..6 {
         let setups = setups.clone();
         let url = server_url.clone();
-        unknown_handles.push(tokio::spawn(async move {
+        forged_handles.push(tokio::spawn(async move {
             let (sapk, _vk) = &setups[0];
-            let client = EmsmClient::new(&url, format!("never-setup-{i}"));
             let mut local_rng = ChaCha20Rng::seed_from_u64(9000 + i as u64);
             let circuit = CubeCircuit {
                 x: Some(Fr::from(3u64)),
             };
-            let (req, _state) =
+            let (req, _) =
                 client_encrypt::<LibsnarkReduction, _, _>(sapk.as_ref(), circuit, &mut local_rng)
                     .unwrap();
-            client.send_prove(&prove_request(&req)).await.is_err()
+
+            // A plausible-looking but never-issued token.
+            let forged = format!("{:064x}", i);
+            let body = bincode::serialize(&prove_request(&req)).unwrap();
+            let resp = reqwest::Client::new()
+                .post(format!("{url}/v1/prove"))
+                .header(
+                    stealthsnark::protocol::messages::VERSION_HEADER,
+                    stealthsnark::protocol::messages::PROTOCOL_VERSION.to_string(),
+                )
+                .bearer_auth(forged)
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            resp.status().as_u16()
         }));
     }
 
     for h in handles {
         h.await.unwrap().expect("a concurrent session failed");
     }
-    for h in unknown_handles {
-        assert!(
+    for h in forged_handles {
+        assert_eq!(
             h.await.unwrap(),
-            "prove against a never-setup session should have been refused"
+            401,
+            "a forged session token must be rejected with 401"
         );
     }
+
+    // Every session released itself; nothing should be left pinned.
+    assert_eq!(
+        state.sessions.len(),
+        0,
+        "sessions leaked after all clients released"
+    );
 }
