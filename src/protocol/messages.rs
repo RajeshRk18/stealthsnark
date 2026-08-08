@@ -146,7 +146,7 @@ mod tests {
         // *byte* count alone would still allocate body_len * size_of::<T>()
         // (~136x amplification for G2Affine); the MAX_PREALLOC_ELEMS cap keeps
         // the upfront allocation constant regardless of body size.
-        buf.extend(std::iter::repeat(0xAAu8).take(64 * 1024));
+        buf.extend(std::iter::repeat_n(0xAAu8, 64 * 1024));
         let r3: Result<Vec<G1Affine>, _> = ark_vec_from_bytes(&buf);
         assert!(r3.is_err());
     }

@@ -100,11 +100,16 @@ async fn concurrent_sessions_stay_isolated() {
             let session_id = format!("sess-{i}");
             let client = EmsmClient::new(&url, session_id);
 
-            client.send_setup(&setup_request(sapk)).await.map_err(|e| format!("setup: {e}"))?;
+            client
+                .send_setup(&setup_request(sapk))
+                .await
+                .map_err(|e| format!("setup: {e}"))?;
 
             // Encryption is synchronous; give each session its own rng.
             let mut local_rng = ChaCha20Rng::seed_from_u64(1000 + i as u64);
-            let circuit = CubeCircuit { x: Some(Fr::from(3u64)) };
+            let circuit = CubeCircuit {
+                x: Some(Fr::from(3u64)),
+            };
             let (req, state) =
                 client_encrypt::<LibsnarkReduction, _, _>(sapk.as_ref(), circuit, &mut local_rng)
                     .map_err(|e| format!("encrypt: {e}"))?;
@@ -116,7 +121,9 @@ async fn concurrent_sessions_stay_isolated() {
             let proof = client_decrypt(sapk.as_ref(), &decode_response(&resp), &state);
 
             if !Groth16::<Bn254>::verify(vk, &[Fr::from(35u64)], &proof).unwrap() {
-                return Err(format!("session {i} proof failed to verify (possible cross-session clobber)"));
+                return Err(format!(
+                    "session {i} proof failed to verify (possible cross-session clobber)"
+                ));
             }
             Ok::<(), String>(())
         }));
@@ -131,7 +138,9 @@ async fn concurrent_sessions_stay_isolated() {
             let (sapk, _vk) = &setups[0];
             let client = EmsmClient::new(&url, format!("never-setup-{i}"));
             let mut local_rng = ChaCha20Rng::seed_from_u64(9000 + i as u64);
-            let circuit = CubeCircuit { x: Some(Fr::from(3u64)) };
+            let circuit = CubeCircuit {
+                x: Some(Fr::from(3u64)),
+            };
             let (req, _state) =
                 client_encrypt::<LibsnarkReduction, _, _>(sapk.as_ref(), circuit, &mut local_rng)
                     .unwrap();

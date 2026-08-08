@@ -15,7 +15,5 @@ async fn main() {
         .expect("failed to bind to port 3000");
 
     tracing::info!("StealthSnark server listening on :3000");
-    axum::serve(listener, app)
-        .await
-        .expect("server error");
+    axum::serve(listener, app).await.expect("server error");
 }

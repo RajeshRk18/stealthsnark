@@ -5,9 +5,7 @@ use ark_snark::SNARK;
 use rand::rngs::OsRng;
 
 use stealthsnark::groth16::circom::{build_circuit, circom_setup, get_public_inputs};
-use stealthsnark::groth16::server_aided::{
-    client_decrypt, client_encrypt, ServerAidedProvingKey,
-};
+use stealthsnark::groth16::server_aided::{client_decrypt, client_encrypt, ServerAidedProvingKey};
 use stealthsnark::protocol::client::EmsmClient;
 use stealthsnark::protocol::messages::*;
 

@@ -60,10 +60,7 @@ pub struct ProveEnvelope {
 }
 
 /// POST /setup: receive and store generators for a session.
-async fn handle_setup(
-    State(state): State<SharedState>,
-    body: axum::body::Bytes,
-) -> StatusCode {
+async fn handle_setup(State(state): State<SharedState>, body: axum::body::Bytes) -> StatusCode {
     let envelope: SetupEnvelope = match bincode::deserialize(&body) {
         Ok(r) => r,
         Err(_) => return StatusCode::BAD_REQUEST,

@@ -76,16 +76,46 @@ fn nonzero_g2(rng: &mut ChaCha20Rng) -> G2 {
 fn tamper(resp: &mut MaliciousServerResponse, mask: u16, rng: &mut ChaCha20Rng) -> u32 {
     let mut changed = 0;
     let bit = |i: u32| -> bool { (mask >> i) & 1 == 1 };
-    if bit(0) { resp.em_h += nonzero_g1(rng); changed += 1; }
-    if bit(1) { resp.em_h_ck += nonzero_g1(rng); changed += 1; }
-    if bit(2) { resp.em_l += nonzero_g1(rng); changed += 1; }
-    if bit(3) { resp.em_l_ck += nonzero_g1(rng); changed += 1; }
-    if bit(4) { resp.em_a += nonzero_g1(rng); changed += 1; }
-    if bit(5) { resp.em_a_ck += nonzero_g1(rng); changed += 1; }
-    if bit(6) { resp.em_b_g1 += nonzero_g1(rng); changed += 1; }
-    if bit(7) { resp.em_b_g1_ck += nonzero_g1(rng); changed += 1; }
-    if bit(8) { resp.em_b_g2 += nonzero_g2(rng); changed += 1; }
-    if bit(9) { resp.em_b_g2_ck += nonzero_g2(rng); changed += 1; }
+    if bit(0) {
+        resp.em_h += nonzero_g1(rng);
+        changed += 1;
+    }
+    if bit(1) {
+        resp.em_h_ck += nonzero_g1(rng);
+        changed += 1;
+    }
+    if bit(2) {
+        resp.em_l += nonzero_g1(rng);
+        changed += 1;
+    }
+    if bit(3) {
+        resp.em_l_ck += nonzero_g1(rng);
+        changed += 1;
+    }
+    if bit(4) {
+        resp.em_a += nonzero_g1(rng);
+        changed += 1;
+    }
+    if bit(5) {
+        resp.em_a_ck += nonzero_g1(rng);
+        changed += 1;
+    }
+    if bit(6) {
+        resp.em_b_g1 += nonzero_g1(rng);
+        changed += 1;
+    }
+    if bit(7) {
+        resp.em_b_g1_ck += nonzero_g1(rng);
+        changed += 1;
+    }
+    if bit(8) {
+        resp.em_b_g2 += nonzero_g2(rng);
+        changed += 1;
+    }
+    if bit(9) {
+        resp.em_b_g2_ck += nonzero_g2(rng);
+        changed += 1;
+    }
     changed
 }
 
@@ -97,7 +127,9 @@ fn honest_round(
     MaliciousServerResponse,
     stealthsnark::groth16::server_aided::MaliciousClientState,
 ) {
-    let circuit = CubeCircuit { x: Some(Fr::from(X)) };
+    let circuit = CubeCircuit {
+        x: Some(Fr::from(X)),
+    };
     let (req, state) =
         malicious_client_encrypt::<LibsnarkReduction, _, _>(sapk, circuit, rng).unwrap();
     let resp = malicious_server_evaluate_groth16(sapk, &req).unwrap();
@@ -110,8 +142,8 @@ fn honest_response_verifies_and_is_sound() {
     let mut rng = ChaCha20Rng::seed_from_u64(100);
     let (resp, state) = honest_round(sapk, &mut rng);
 
-    let proof = malicious_client_decrypt(sapk, &resp, &state)
-        .expect("honest response must decrypt");
+    let proof =
+        malicious_client_decrypt(sapk, &resp, &state).expect("honest response must decrypt");
     assert!(
         Groth16::<Bn254>::verify(vk, &correct_public(), &proof).unwrap(),
         "honest proof must verify for the correct input"

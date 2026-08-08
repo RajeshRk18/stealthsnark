@@ -9,9 +9,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
 use stealthsnark::groth16::circuit::CubeCircuit;
-use stealthsnark::groth16::server_aided::{
-    client_decrypt, client_encrypt, ServerAidedProvingKey,
-};
+use stealthsnark::groth16::server_aided::{client_decrypt, client_encrypt, ServerAidedProvingKey};
 use stealthsnark::protocol::client::EmsmClient;
 use stealthsnark::protocol::messages::*;
 use stealthsnark::protocol::server::{create_router, ServerState};
@@ -37,8 +35,7 @@ async fn test_integration_e2e() {
 
     // Groth16 setup
     let circuit_for_setup = CubeCircuit::<Fr> { x: None };
-    let (pk, vk) =
-        Groth16::<Bn254>::circuit_specific_setup(circuit_for_setup, &mut rng).unwrap();
+    let (pk, vk) = Groth16::<Bn254>::circuit_specific_setup(circuit_for_setup, &mut rng).unwrap();
 
     // Server-aided proving key
     let sapk = ServerAidedProvingKey::setup(pk, &mut rng);
@@ -58,7 +55,9 @@ async fn test_integration_e2e() {
         .expect("setup failed");
 
     // Encrypt
-    let circuit = CubeCircuit { x: Some(Fr::from(3u64)) };
+    let circuit = CubeCircuit {
+        x: Some(Fr::from(3u64)),
+    };
     let (request, state) =
         client_encrypt::<LibsnarkReduction, _, _>(&sapk, circuit, &mut rng).unwrap();
 
@@ -121,8 +120,7 @@ async fn test_session_isolation() {
 
     // Setup session A
     let circuit_for_setup = CubeCircuit::<Fr> { x: None };
-    let (pk, vk) =
-        Groth16::<Bn254>::circuit_specific_setup(circuit_for_setup, &mut rng).unwrap();
+    let (pk, vk) = Groth16::<Bn254>::circuit_specific_setup(circuit_for_setup, &mut rng).unwrap();
     let sapk = ServerAidedProvingKey::setup(pk, &mut rng);
 
     let client_a = EmsmClient::new(&server_url, "session-a".to_string());
@@ -137,7 +135,9 @@ async fn test_session_isolation() {
 
     // Client B tries to prove against session-b which was never set up
     let client_b = EmsmClient::new(&server_url, "session-b".to_string());
-    let circuit = CubeCircuit { x: Some(Fr::from(3u64)) };
+    let circuit = CubeCircuit {
+        x: Some(Fr::from(3u64)),
+    };
     let (request, _state) =
         client_encrypt::<LibsnarkReduction, _, _>(&sapk, circuit, &mut rng).unwrap();
     let prove_req = ProveRequest {
@@ -152,7 +152,9 @@ async fn test_session_isolation() {
     assert!(result.is_err(), "Prove against unknown session should fail");
 
     // Client A should still work
-    let circuit2 = CubeCircuit { x: Some(Fr::from(3u64)) };
+    let circuit2 = CubeCircuit {
+        x: Some(Fr::from(3u64)),
+    };
     let (request2, state2) =
         client_encrypt::<LibsnarkReduction, _, _>(&sapk, circuit2, &mut rng).unwrap();
     let prove_req2 = ProveRequest {
@@ -168,8 +170,12 @@ async fn test_session_isolation() {
         em_h: ark_from_bytes::<G1Affine>(&prove_resp.em_h).unwrap().into(),
         em_l: ark_from_bytes::<G1Affine>(&prove_resp.em_l).unwrap().into(),
         em_a: ark_from_bytes::<G1Affine>(&prove_resp.em_a).unwrap().into(),
-        em_b_g1: ark_from_bytes::<G1Affine>(&prove_resp.em_b_g1).unwrap().into(),
-        em_b_g2: ark_from_bytes::<G2Affine>(&prove_resp.em_b_g2).unwrap().into(),
+        em_b_g1: ark_from_bytes::<G1Affine>(&prove_resp.em_b_g1)
+            .unwrap()
+            .into(),
+        em_b_g2: ark_from_bytes::<G2Affine>(&prove_resp.em_b_g2)
+            .unwrap()
+            .into(),
     };
     let proof = client_decrypt(&sapk, &server_response, &state2);
     let valid = Groth16::<Bn254>::verify(&vk, &[Fr::from(35u64)], &proof).unwrap();

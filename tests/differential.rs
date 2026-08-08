@@ -40,7 +40,9 @@ fn setup(rng: &mut ChaCha20Rng) -> (ServerAidedProvingKey, ark_groth16::Verifyin
 
 /// Run the full semi-honest server-aided flow and return the assembled proof.
 fn prove_semi_honest(sapk: &ServerAidedProvingKey, x: u64, rng: &mut ChaCha20Rng) -> Proof<Bn254> {
-    let circuit = CubeCircuit { x: Some(Fr::from(x)) };
+    let circuit = CubeCircuit {
+        x: Some(Fr::from(x)),
+    };
     let (request, state) =
         client_encrypt::<LibsnarkReduction, _, _>(sapk, circuit, rng).expect("encrypt failed");
     let response = server_evaluate(sapk, &request).expect("server evaluate failed");
@@ -49,7 +51,9 @@ fn prove_semi_honest(sapk: &ServerAidedProvingKey, x: u64, rng: &mut ChaCha20Rng
 
 /// Run the full malicious-secure server-aided flow and return the assembled proof.
 fn prove_malicious(sapk: &ServerAidedProvingKey, x: u64, rng: &mut ChaCha20Rng) -> Proof<Bn254> {
-    let circuit = CubeCircuit { x: Some(Fr::from(x)) };
+    let circuit = CubeCircuit {
+        x: Some(Fr::from(x)),
+    };
     let (request, state) = malicious_client_encrypt::<LibsnarkReduction, _, _>(sapk, circuit, rng)
         .expect("malicious encrypt failed");
     let response =
@@ -70,7 +74,9 @@ fn server_aided_proof_matches_vanilla_groth16() {
         // Reference oracle: the stock ark-groth16 prover, using the *same* pk.
         let vanilla = Groth16::<Bn254>::prove(
             &sapk.pk,
-            CubeCircuit { x: Some(Fr::from(x)) },
+            CubeCircuit {
+                x: Some(Fr::from(x)),
+            },
             &mut rng,
         )
         .expect("vanilla groth16 prove failed");

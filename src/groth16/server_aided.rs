@@ -110,7 +110,9 @@ pub fn client_encrypt<QAP: R1CSToQAP, C: ConstraintSynthesizer<Fr>, R: Rng>(
 ) -> Result<(EncryptedRequest, ClientDecryptionState), anyhow::Error> {
     let cs = ConstraintSystem::<Fr>::new_ref();
     cs.set_optimization_goal(OptimizationGoal::Constraints);
-    cs.set_mode(SynthesisMode::Prove { construct_matrices: true });
+    cs.set_mode(SynthesisMode::Prove {
+        construct_matrices: true,
+    });
     circuit.generate_constraints(cs.clone())?;
     cs.finalize();
 
@@ -251,8 +253,7 @@ pub fn client_decrypt(
     let g_b_g1: G1 = beta_g1 + b_g1_pub + b_g1_witness_msm + delta_g1 * state.s;
 
     // pi_c = h_msm + l_msm + s*g_a + r*g_b_g1 - r*s*delta_g1
-    let g_c: G1 =
-        h_msm + l_msm + g_a * state.s + g_b_g1 * state.r - delta_g1 * (state.r * state.s);
+    let g_c: G1 = h_msm + l_msm + g_a * state.s + g_b_g1 * state.r - delta_g1 * (state.r * state.s);
 
     Proof {
         a: g_a.into_affine(),
@@ -309,7 +310,9 @@ pub fn malicious_client_encrypt<QAP: R1CSToQAP, C: ConstraintSynthesizer<Fr>, R:
 ) -> Result<(MaliciousEncryptedRequest, MaliciousClientState), anyhow::Error> {
     let cs = ConstraintSystem::<Fr>::new_ref();
     cs.set_optimization_goal(OptimizationGoal::Constraints);
-    cs.set_mode(SynthesisMode::Prove { construct_matrices: true });
+    cs.set_mode(SynthesisMode::Prove {
+        construct_matrices: true,
+    });
     circuit.generate_constraints(cs.clone())?;
     cs.finalize();
 
@@ -384,11 +387,13 @@ pub fn malicious_server_evaluate_groth16(
     );
     let (em_b_g1, em_b_g1_ck) = (
         sapk.emsm_b_g1.server_computation(&request.b_g1.masked)?,
-        sapk.emsm_b_g1.server_computation(&request.b_g1.masked_check)?,
+        sapk.emsm_b_g1
+            .server_computation(&request.b_g1.masked_check)?,
     );
     let (em_b_g2, em_b_g2_ck) = (
         sapk.emsm_b_g2.server_computation(&request.b_g2.masked)?,
-        sapk.emsm_b_g2.server_computation(&request.b_g2.masked_check)?,
+        sapk.emsm_b_g2
+            .server_computation(&request.b_g2.masked_check)?,
     );
 
     Ok(MaliciousServerResponse {
@@ -466,8 +471,7 @@ pub fn malicious_client_decrypt(
     let beta_g1: G1 = sapk.pk.beta_g1.into();
     let g_b_g1: G1 = beta_g1 + b_g1_pub + b_g1_witness_msm + delta_g1 * state.s;
 
-    let g_c: G1 =
-        h_msm + l_msm + g_a * state.s + g_b_g1 * state.r - delta_g1 * (state.r * state.s);
+    let g_c: G1 = h_msm + l_msm + g_a * state.s + g_b_g1 * state.r - delta_g1 * (state.r * state.s);
 
     Ok(Proof {
         a: g_a.into_affine(),
@@ -518,9 +522,11 @@ mod tests {
         let sapk = ServerAidedProvingKey::setup(pk, &mut rng);
 
         // Client: encrypt (x = 3, so y = 3^3 + 3 + 5 = 35)
-        let circuit = CubeCircuit { x: Some(Fr::from(3u64)) };
-        let (request, state) =
-            client_encrypt::<LibsnarkReduction, _, _>(&sapk, circuit, &mut rng).expect("encrypt failed");
+        let circuit = CubeCircuit {
+            x: Some(Fr::from(3u64)),
+        };
+        let (request, state) = client_encrypt::<LibsnarkReduction, _, _>(&sapk, circuit, &mut rng)
+            .expect("encrypt failed");
 
         // Server: evaluate 5 MSMs
         let response = server_evaluate(&sapk, &request).expect("server evaluate failed");
@@ -530,8 +536,8 @@ mod tests {
 
         // Verify the proof
         let public_inputs = vec![Fr::from(35u64)];
-        let valid = Groth16::<Bn254>::verify(&vk, &public_inputs, &proof)
-            .expect("verification failed");
+        let valid =
+            Groth16::<Bn254>::verify(&vk, &public_inputs, &proof).expect("verification failed");
         assert!(valid, "Server-aided Groth16 proof should verify!");
     }
 
@@ -545,21 +551,26 @@ mod tests {
 
         let sapk = ServerAidedProvingKey::setup(pk, &mut rng);
 
-        let circuit = CubeCircuit { x: Some(Fr::from(3u64)) };
+        let circuit = CubeCircuit {
+            x: Some(Fr::from(3u64)),
+        };
         let (request, state) =
             malicious_client_encrypt::<LibsnarkReduction, _, _>(&sapk, circuit, &mut rng)
                 .expect("encrypt failed");
 
-        let response = malicious_server_evaluate_groth16(&sapk, &request)
-            .expect("server evaluate failed");
+        let response =
+            malicious_server_evaluate_groth16(&sapk, &request).expect("server evaluate failed");
 
         let proof = malicious_client_decrypt(&sapk, &response, &state)
             .expect("consistency check should pass for honest server");
 
         let public_inputs = vec![Fr::from(35u64)];
-        let valid = Groth16::<Bn254>::verify(&vk, &public_inputs, &proof)
-            .expect("verification failed");
-        assert!(valid, "Malicious-secure server-aided Groth16 proof should verify!");
+        let valid =
+            Groth16::<Bn254>::verify(&vk, &public_inputs, &proof).expect("verification failed");
+        assert!(
+            valid,
+            "Malicious-secure server-aided Groth16 proof should verify!"
+        );
     }
 
     #[test]
@@ -572,13 +583,15 @@ mod tests {
 
         let sapk = ServerAidedProvingKey::setup(pk, &mut rng);
 
-        let circuit = CubeCircuit { x: Some(Fr::from(3u64)) };
+        let circuit = CubeCircuit {
+            x: Some(Fr::from(3u64)),
+        };
         let (request, state) =
             malicious_client_encrypt::<LibsnarkReduction, _, _>(&sapk, circuit, &mut rng)
                 .expect("encrypt failed");
 
-        let mut response = malicious_server_evaluate_groth16(&sapk, &request)
-            .expect("server evaluate failed");
+        let mut response =
+            malicious_server_evaluate_groth16(&sapk, &request).expect("server evaluate failed");
 
         // Tamper with one MSM result
         response.em_h += G1::rand(&mut rng);

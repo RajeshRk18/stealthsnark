@@ -46,7 +46,9 @@ fn semi_honest_uses_distinct_noise_per_msm() {
         Groth16::<ark_bn254::Bn254>::circuit_specific_setup(circuit_for_setup, &mut rng).unwrap();
     let sapk = ServerAidedProvingKey::setup(pk, &mut rng);
 
-    let circuit = CubeCircuit { x: Some(Fr::from(3u64)) };
+    let circuit = CubeCircuit {
+        x: Some(Fr::from(3u64)),
+    };
     let (_req, state) =
         client_encrypt::<LibsnarkReduction, _, _>(&sapk, circuit, &mut rng).unwrap();
 
@@ -76,7 +78,9 @@ fn malicious_main_and_check_noise_are_independent() {
         Groth16::<ark_bn254::Bn254>::circuit_specific_setup(circuit_for_setup, &mut rng).unwrap();
     let sapk = ServerAidedProvingKey::setup(pk, &mut rng);
 
-    let circuit = CubeCircuit { x: Some(Fr::from(3u64)) };
+    let circuit = CubeCircuit {
+        x: Some(Fr::from(3u64)),
+    };
     let (_req, state) =
         malicious_client_encrypt::<LibsnarkReduction, _, _>(&sapk, circuit, &mut rng).unwrap();
 
@@ -173,7 +177,10 @@ fn each_coordinate_of_mask_is_non_constant() {
         }
     }
     let stuck: Vec<usize> = (0..n).filter(|&j| !varies[j]).collect();
-    assert!(stuck.is_empty(), "mask coordinates stuck at a constant: {stuck:?}");
+    assert!(
+        stuck.is_empty(),
+        "mask coordinates stuck at a constant: {stuck:?}"
+    );
 }
 
 /// Low-nibble (16-bin) histogram of the field elements' least-significant byte.
@@ -255,7 +262,9 @@ fn proof_blinders_make_each_proof_unique() {
 
     use stealthsnark::groth16::server_aided::{client_decrypt, server_evaluate};
     let prove = |rng: &mut ChaCha20Rng| {
-        let circuit = CubeCircuit { x: Some(Fr::from(3u64)) };
+        let circuit = CubeCircuit {
+            x: Some(Fr::from(3u64)),
+        };
         let (req, st) = client_encrypt::<LibsnarkReduction, _, _>(&sapk, circuit, rng).unwrap();
         let resp = server_evaluate(&sapk, &req).unwrap();
         client_decrypt(&sapk, &resp, &st)

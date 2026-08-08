@@ -512,12 +512,17 @@ mod tests {
 
     #[test]
     fn test_suffix_sum() {
-        let mut v = vec![Fr::from(1u64), Fr::from(2u64), Fr::from(3u64), Fr::from(4u64)];
+        let mut v = vec![
+            Fr::from(1u64),
+            Fr::from(2u64),
+            Fr::from(3u64),
+            Fr::from(4u64),
+        ];
         accumulate_inplace(&mut v);
         assert_eq!(v[0], Fr::from(10u64)); // 1+2+3+4
-        assert_eq!(v[1], Fr::from(9u64));  // 2+3+4
-        assert_eq!(v[2], Fr::from(7u64));  // 3+4
-        assert_eq!(v[3], Fr::from(4u64));  // 4
+        assert_eq!(v[1], Fr::from(9u64)); // 2+3+4
+        assert_eq!(v[2], Fr::from(7u64)); // 3+4
+        assert_eq!(v[3], Fr::from(4u64)); // 4
     }
 
     #[test]
@@ -536,8 +541,14 @@ mod tests {
     #[test]
     fn test_fold() {
         let v = vec![
-            Fr::from(1u64), Fr::from(2u64), Fr::from(3u64), Fr::from(4u64),
-            Fr::from(5u64), Fr::from(6u64), Fr::from(7u64), Fr::from(8u64),
+            Fr::from(1u64),
+            Fr::from(2u64),
+            Fr::from(3u64),
+            Fr::from(4u64),
+            Fr::from(5u64),
+            Fr::from(6u64),
+            Fr::from(7u64),
+            Fr::from(8u64),
         ];
         let folded = apply_f_fold(&v);
         assert_eq!(folded.len(), 2);
@@ -558,9 +569,9 @@ mod tests {
         let v: Vec<Fr> = (0..len).map(|j| Fr::from(j as u64)).collect();
         let folded = apply_f_fold(&v);
         assert_eq!(folded.len(), len / 4);
-        for i in 0..(len / 4) {
+        for (i, f) in folded.iter().enumerate() {
             // (4i) + (4i+1) + (4i+2) + (4i+3) = 16i + 6
-            assert_eq!(folded[i], Fr::from(16u64 * i as u64 + 6), "fold mismatch at {i}");
+            assert_eq!(*f, Fr::from(16u64 * i as u64 + 6), "fold mismatch at {i}");
         }
     }
 
@@ -607,7 +618,10 @@ mod tests {
 
         // Result should be nonzero (overwhelmingly likely)
         let is_nonzero = result.iter().any(|x| !x.is_zero());
-        assert!(is_nonzero, "TOperator output should be nonzero for nonzero input");
+        assert!(
+            is_nonzero,
+            "TOperator output should be nonzero for nonzero input"
+        );
     }
 
     #[test]
@@ -626,7 +640,11 @@ mod tests {
         let r_combined = t_op.multiply_sparse::<Fr>(&e_combined);
 
         for i in 0..n {
-            assert_eq!(r1[i] + r2[i], r_combined[i], "linearity failed at index {i}");
+            assert_eq!(
+                r1[i] + r2[i],
+                r_combined[i],
+                "linearity failed at index {i}"
+            );
         }
     }
 }

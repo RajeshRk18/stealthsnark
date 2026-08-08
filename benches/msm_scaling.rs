@@ -60,7 +60,9 @@ fn bench_server_aided_proving(c: &mut Criterion) {
 
     c.bench_function("server_aided_prove_cube", |b| {
         b.iter(|| {
-            let circuit = CubeCircuit { x: Some(Fr::from(3u64)) };
+            let circuit = CubeCircuit {
+                x: Some(Fr::from(3u64)),
+            };
             let (req, st) =
                 client_encrypt::<LibsnarkReduction, _, _>(&sapk, circuit, &mut rng).unwrap();
             let resp = server_evaluate(&sapk, &req).unwrap();
