@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
     // Step 3: Send generators to server. The session token comes back from the
     // server; the client does not pick its own identifier.
     println!("[3/6] Sending generators to server...");
-    let mut http_client = EmsmClient::new(&server_url)?;
+    let mut http_client = build_client(&server_url)?;
     let setup_request = SetupRequest::encode::<G1Affine, G2Affine>(
         &sapk.emsm_h.generators,
         &sapk.emsm_l.generators,
@@ -101,4 +101,34 @@ async fn main() -> anyhow::Result<()> {
         // Exit non-zero so a scripted caller notices.
         anyhow::bail!("proof verification failed")
     }
+}
+
+/// Assemble the client from the environment.
+///
+/// Credentials and TLS trust come from the environment rather than from flags, so
+/// the demo can reach a secured server without a rebuild, and so a key never
+/// appears in shell history or a process listing.
+fn build_client(server_url: &str) -> anyhow::Result<EmsmClient> {
+    let mut builder = EmsmClient::builder(server_url);
+
+    // Verify the server against a private CA. Needed for any internal service,
+    // whose certificate no public CA has signed.
+    if let Ok(path) = std::env::var("STEALTHSNARK_CA_CERT") {
+        builder = builder.root_certificate_file(&path)?;
+        println!("      trusting CA from {path}");
+    }
+
+    // mTLS: certificate and key in one PEM file. Checked before the API key,
+    // because a certificate identifies the connection itself.
+    if let Ok(path) = std::env::var("STEALTHSNARK_CLIENT_IDENTITY") {
+        builder = builder.client_identity_file(&path)?;
+        println!("      presenting client certificate from {path}");
+    } else if let Ok(key) = std::env::var("STEALTHSNARK_API_KEY") {
+        builder = builder.api_key(key);
+        println!("      authenticating with an API key");
+    } else {
+        println!("      no credential set; the server must have auth disabled");
+    }
+
+    builder.build()
 }

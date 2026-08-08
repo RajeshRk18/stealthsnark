@@ -18,12 +18,33 @@ name = "client"
 path = "src/bin/client.rs"
 required-features = ["circom"]
 
+# Credential administration: mints API keys and prints the record to add to the
+# auth file. Auth is only usable if there is a supported way to create a key.
+[[bin]]
+name = "keygen"
+path = "src/bin/keygen.rs"
+
 [features]
 # Circom integration pulls in ark-circom -> wasmer, a heavy dependency that does
 # not build under the cargo-fuzz sanitizer toolchain. It is on by default but can
 # be disabled (`--no-default-features`) to get a lean core for fuzzing/embedding.
-default = ["circom"]
+default = ["circom", "tls"]
 circom = ["dep:ark-circom", "dep:num-bigint"]
+
+# TLS / mTLS support. Separate from the core because the TLS listener needs its
+# own accept loop (rustls + hyper-util) to read the client certificate, and
+# because the lean core must stay buildable under the cargo-fuzz sanitizer.
+# With this off, the server serves plain HTTP and refuses to start if TLS is
+# configured, rather than silently downgrading.
+tls = [
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:rustls-pemfile",
+    "dep:rustls-pki-types",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:tower",
+]
 
 [dependencies]
 # Arkworks 0.5
@@ -42,8 +63,45 @@ ark-crypto-primitives = { version = "0.5" }
 # Networking
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
-reqwest = { version = "0.12", features = ["json"] }
+# rustls rather than native-tls: one TLS stack for both the client and the server
+# listener, and client certificates (mTLS) work the same way on every platform.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "http2",
+    "charset",
+    "rustls-tls",
+] }
 tower-http = { version = "0.6", features = ["trace", "timeout", "request-id", "catch-panic"] }
+
+# TLS (optional — see [features].tls)
+# `ring` rather than the default aws-lc-rs: no cmake in the build path.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+    "logging",
+], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+rustls-pki-types = { version = "1", optional = true }
+# axum::serve cannot expose the peer certificate, so the TLS listener drives its
+# own accept loop and serves each connection with hyper directly.
+hyper = { version = "1", features = ["http1", "http2", "server"], optional = true }
+hyper-util = { version = "0.1", features = [
+    "server",
+    "server-auto",
+    "tokio",
+], optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
+
+# Credential hashing. API keys are stored as SHA-256 digests and compared in
+# constant time, so the auth file never holds a usable secret.
+sha2 = "0.10"
+subtle = "2.6"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -69,6 +127,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tokio-test = "0.4"
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
+# Generates a throwaway CA, server certificate, and client certificates in-memory
+# for the TLS/mTLS suite, so no fixture keys are committed to the repository.
+rcgen = "0.13"
 
 [[bench]]
 name = "msm_scaling"

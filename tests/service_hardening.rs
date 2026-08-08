@@ -17,7 +17,7 @@ use ark_std::UniformRand;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
-use common::{spawn_server, spawn_server_with};
+use common::{error_code, raw, spawn_admin, spawn_server, spawn_server_with};
 use stealthsnark::protocol::config::ServerConfig;
 use stealthsnark::protocol::messages::*;
 
@@ -46,15 +46,6 @@ async fn post_setup(url: &str, body: Vec<u8>, version: Option<&str>) -> reqwest:
     req.send().await.unwrap()
 }
 
-/// Extract the machine-readable `code` from an error response body.
-async fn error_code(resp: reqwest::Response) -> String {
-    let bytes = resp.bytes().await.unwrap();
-    serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
-        .and_then(|v| v.get("code")?.as_str().map(str::to_string))
-        .unwrap_or_else(|| format!("<unparseable: {}>", String::from_utf8_lossy(&bytes)))
-}
-
 // ---------------------------------------------------------------------------
 // The functional ceiling
 // ---------------------------------------------------------------------------
@@ -74,7 +65,7 @@ async fn setup_accepts_payload_above_the_old_2mib_ceiling() {
         body.len()
     );
 
-    let resp = post_setup(&url, body, Some("1")).await;
+    let resp = post_setup(&url, body, Some(&PROTOCOL_VERSION.to_string())).await;
     assert!(
         resp.status().is_success(),
         "a {:.2} MiB generator upload must be accepted, got {}",
@@ -94,7 +85,12 @@ async fn setup_rejects_payload_above_configured_limit() {
     };
     let (url, state) = spawn_server_with(cfg).await;
 
-    let resp = post_setup(&url, generators_body(20_000, 2), Some("1")).await;
+    let resp = post_setup(
+        &url,
+        generators_body(20_000, 2),
+        Some(&PROTOCOL_VERSION.to_string()),
+    )
+    .await;
     assert_eq!(resp.status().as_u16(), 413);
     assert_eq!(state.sessions.len(), 0);
 }
@@ -122,7 +118,7 @@ async fn forged_and_missing_tokens_are_refused() {
     // No Authorization header at all.
     let resp = client()
         .post(format!("{url}/v1/prove"))
-        .header(VERSION_HEADER, "1")
+        .header(VERSION_HEADER, PROTOCOL_VERSION.to_string())
         .body(prove_body.clone())
         .send()
         .await
@@ -133,8 +129,8 @@ async fn forged_and_missing_tokens_are_refused() {
     // A well-formed but never-issued token.
     let resp = client()
         .post(format!("{url}/v1/prove"))
-        .header(VERSION_HEADER, "1")
-        .bearer_auth("f".repeat(64))
+        .header(VERSION_HEADER, PROTOCOL_VERSION.to_string())
+        .header(SESSION_HEADER, "f".repeat(64))
         .body(prove_body)
         .send()
         .await
@@ -150,7 +146,12 @@ async fn concurrent_setups_do_not_clobber_each_other() {
 
     let mut tokens = Vec::new();
     for seed in 0..3u64 {
-        let resp = post_setup(&url, generators_body(8, seed), Some("1")).await;
+        let resp = post_setup(
+            &url,
+            generators_body(8, seed),
+            Some(&PROTOCOL_VERSION.to_string()),
+        )
+        .await;
         assert!(resp.status().is_success());
         let parsed: SetupResponse = bincode::deserialize(&resp.bytes().await.unwrap()).unwrap();
         assert_eq!(parsed.session_token.len(), 64, "expected 256 bits of hex");
@@ -180,7 +181,12 @@ async fn expired_sessions_are_refused_and_freed() {
     };
     let (url, state) = spawn_server_with(cfg).await;
 
-    let resp = post_setup(&url, generators_body(8, 7), Some("1")).await;
+    let resp = post_setup(
+        &url,
+        generators_body(8, 7),
+        Some(&PROTOCOL_VERSION.to_string()),
+    )
+    .await;
     let parsed: SetupResponse = bincode::deserialize(&resp.bytes().await.unwrap()).unwrap();
     assert!(state.sessions.get(&parsed.session_token).is_some());
 
@@ -208,13 +214,22 @@ async fn session_cap_is_enforced() {
     let (url, state) = spawn_server_with(cfg).await;
 
     for seed in 0..2u64 {
-        assert!(post_setup(&url, generators_body(4, seed), Some("1"))
-            .await
-            .status()
-            .is_success());
+        assert!(post_setup(
+            &url,
+            generators_body(4, seed),
+            Some(&PROTOCOL_VERSION.to_string())
+        )
+        .await
+        .status()
+        .is_success());
     }
 
-    let resp = post_setup(&url, generators_body(4, 99), Some("1")).await;
+    let resp = post_setup(
+        &url,
+        generators_body(4, 99),
+        Some(&PROTOCOL_VERSION.to_string()),
+    )
+    .await;
     assert_eq!(resp.status().as_u16(), 429);
     assert!(
         resp.headers().contains_key("retry-after"),
@@ -234,7 +249,7 @@ async fn session_cap_is_enforced() {
 async fn version_header_is_required_and_enforced() {
     let (url, _state) = spawn_server().await;
 
-    for version in [None, Some("0"), Some("2"), Some("banana")] {
+    for version in [None, Some("0"), Some("1"), Some("99"), Some("banana")] {
         let resp = post_setup(&url, generators_body(4, 11), version).await;
         assert_eq!(
             resp.status().as_u16(),
@@ -252,7 +267,7 @@ async fn failure_modes_are_distinguishable() {
     let (url, _state) = spawn_server().await;
 
     // Corrupt bincode framing.
-    let resp = post_setup(&url, vec![0xff; 64], Some("1")).await;
+    let resp = post_setup(&url, vec![0xff; 64], Some(&PROTOCOL_VERSION.to_string())).await;
     assert_eq!(resp.status().as_u16(), 400);
     assert_eq!(error_code(resp).await, "malformed_body");
 
@@ -265,7 +280,7 @@ async fn failure_modes_are_distinguishable() {
         b_g2_generators: vec![0xAA; 128],
     })
     .unwrap();
-    let resp = post_setup(&url, bad_points, Some("1")).await;
+    let resp = post_setup(&url, bad_points, Some(&PROTOCOL_VERSION.to_string())).await;
     assert_eq!(resp.status().as_u16(), 400);
     assert_eq!(error_code(resp).await, "invalid_input");
 }
@@ -276,7 +291,12 @@ async fn failure_modes_are_distinguishable() {
 async fn length_mismatch_is_reported_as_invalid_input() {
     let (url, state) = spawn_server().await;
 
-    let resp = post_setup(&url, generators_body(8, 21), Some("1")).await;
+    let resp = post_setup(
+        &url,
+        generators_body(8, 21),
+        Some(&PROTOCOL_VERSION.to_string()),
+    )
+    .await;
     let parsed: SetupResponse = bincode::deserialize(&resp.bytes().await.unwrap()).unwrap();
 
     // 8 generators were registered; send 3 scalars.
@@ -293,8 +313,8 @@ async fn length_mismatch_is_reported_as_invalid_input() {
 
     let resp = client()
         .post(format!("{url}/v1/prove"))
-        .header(VERSION_HEADER, "1")
-        .bearer_auth(&parsed.session_token)
+        .header(VERSION_HEADER, PROTOCOL_VERSION.to_string())
+        .header(SESSION_HEADER, &parsed.session_token)
         .body(body)
         .send()
         .await
@@ -311,14 +331,19 @@ async fn length_mismatch_is_reported_as_invalid_input() {
 async fn release_frees_the_session_and_invalidates_the_token() {
     let (url, state) = spawn_server().await;
 
-    let resp = post_setup(&url, generators_body(16, 33), Some("1")).await;
+    let resp = post_setup(
+        &url,
+        generators_body(16, 33),
+        Some(&PROTOCOL_VERSION.to_string()),
+    )
+    .await;
     let parsed: SetupResponse = bincode::deserialize(&resp.bytes().await.unwrap()).unwrap();
     assert!(state.sessions.resident_bytes() > 0);
 
     let resp = client()
         .delete(format!("{url}/v1/session"))
-        .header(VERSION_HEADER, "1")
-        .bearer_auth(&parsed.session_token)
+        .header(VERSION_HEADER, PROTOCOL_VERSION.to_string())
+        .header(SESSION_HEADER, &parsed.session_token)
         .send()
         .await
         .unwrap();
@@ -329,8 +354,8 @@ async fn release_frees_the_session_and_invalidates_the_token() {
     // Double release is refused rather than silently accepted.
     let resp = client()
         .delete(format!("{url}/v1/session"))
-        .header(VERSION_HEADER, "1")
-        .bearer_auth(&parsed.session_token)
+        .header(VERSION_HEADER, PROTOCOL_VERSION.to_string())
+        .header(SESSION_HEADER, &parsed.session_token)
         .send()
         .await
         .unwrap();
@@ -341,27 +366,97 @@ async fn release_frees_the_session_and_invalidates_the_token() {
 // Operability
 // ---------------------------------------------------------------------------
 
-/// Health endpoints answer without a version header or a credential — a probe
-/// should not need to know the protocol.
+/// Health endpoints live on the admin plane, answer without a credential, and
+/// need no version header — a probe must not have to know the protocol.
+///
+/// They are deliberately absent from the data plane: that port requires a
+/// credential, and a probe that had to authenticate would be one more thing to
+/// get wrong during an incident.
 #[tokio::test]
-async fn health_endpoints_are_unauthenticated_and_unversioned() {
-    let (url, _state) = spawn_server().await;
+async fn health_endpoints_are_on_the_admin_plane_only() {
+    let (data_url, state) = spawn_server().await;
+    let admin_url = spawn_admin(state).await;
 
     for path in ["/livez", "/readyz"] {
-        let resp = client().get(format!("{url}{path}")).send().await.unwrap();
+        let resp = client()
+            .get(format!("{admin_url}{path}"))
+            .send()
+            .await
+            .unwrap();
         assert!(
             resp.status().is_success(),
-            "{path} returned {}",
+            "admin {path} returned {}",
             resp.status()
         );
+
+        // Not routable on the data plane, so scrape traffic and client traffic
+        // cannot be confused for one another. The version header is supplied so
+        // that a 404 proves the route is absent, rather than the middleware
+        // having refused the request before routing.
+        let resp = raw(
+            &client(),
+            reqwest::Method::GET,
+            format!("{data_url}{path}"),
+            None,
+            None,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            404,
+            "data plane must not serve {path}"
+        );
     }
+}
+
+/// `/metrics` is admin-plane only. Exposing it on the data port would publish
+/// internal state to every client that can reach the service.
+#[tokio::test]
+async fn metrics_are_not_exposed_on_the_data_plane() {
+    let (data_url, state) = spawn_server().await;
+    let admin_url = spawn_admin(state).await;
+
+    let resp = raw(
+        &client(),
+        reqwest::Method::GET,
+        format!("{data_url}/metrics"),
+        None,
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+
+    // Without a version header the middleware refuses before routing, so an
+    // unauthenticated caller cannot even enumerate which paths exist.
+    let probe = client()
+        .get(format!("{data_url}/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        probe.status().is_client_error() && probe.status().as_u16() != 404,
+        "path existence must not leak to an unversioned caller, got {}",
+        probe.status()
+    );
+
+    let resp = client()
+        .get(format!("{admin_url}/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
 }
 
 /// `/metrics` reflects real traffic, including the cheating-server counter that
 /// previously existed only as a client-side `Result`.
 #[tokio::test]
 async fn metrics_reflect_traffic() {
-    let (url, _state) = spawn_server().await;
+    let (data_url, state) = spawn_server().await;
+    let admin_url = spawn_admin(state).await;
 
     let scrape = |url: String| async move {
         client()
@@ -374,7 +469,7 @@ async fn metrics_reflect_traffic() {
             .unwrap()
     };
 
-    let before = scrape(url.clone()).await;
+    let before = scrape(admin_url.clone()).await;
     assert!(before.contains("stealthsnark_setup_requests_ok_total 0"));
     assert!(before.contains("stealthsnark_active_sessions 0"));
     assert!(
@@ -382,11 +477,12 @@ async fn metrics_reflect_traffic() {
         "the cheating-server counter must be exported"
     );
 
-    post_setup(&url, generators_body(8, 55), Some("1")).await;
+    let version = PROTOCOL_VERSION.to_string();
+    post_setup(&data_url, generators_body(8, 55), Some(&version)).await;
     // One refused request, to prove rejections are counted separately.
-    post_setup(&url, vec![0xff; 32], Some("1")).await;
+    post_setup(&data_url, vec![0xff; 32], Some(&version)).await;
 
-    let after = scrape(url).await;
+    let after = scrape(admin_url).await;
     assert!(
         after.contains("stealthsnark_setup_requests_ok_total 1"),
         "{after}"

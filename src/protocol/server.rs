@@ -1,31 +1,40 @@
 //! HTTP server for the EMSM protocol.
 //!
-//! Endpoints (all request/response bodies are bincode, `application/octet-stream`):
+//! # Two listeners
 //!
-//! | Method | Path           | Auth   | Purpose                                  |
-//! |--------|----------------|--------|------------------------------------------|
-//! | POST   | `/v1/setup`    | none   | upload generators, receive session token |
-//! | POST   | `/v1/prove`    | bearer | evaluate the five MSMs                   |
-//! | DELETE | `/v1/session`  | bearer | release generators early                 |
-//! | GET    | `/livez`       | none   | process is up                            |
-//! | GET    | `/readyz`      | none   | process can accept work                  |
-//! | GET    | `/metrics`     | none   | Prometheus text format                   |
+//! | Plane | Bind | Transport | Credential | Paths |
+//! |---|---|---|---|---|
+//! | Data | `STEALTHSNARK_BIND` | TLS when configured | API key or client certificate | `/v1/*` |
+//! | Admin | loopback only | plain HTTP | none | `/livez`, `/readyz`, `/metrics` |
 //!
-//! Two structural properties are worth stating up front, because they are the
-//! difference between this and the previous version.
+//! The split is deliberate. A health probe must work without a credential, and
+//! `/metrics` reports internal state that must not leave the host. One port
+//! cannot satisfy both; two ports satisfy both without any conditional
+//! authentication rule that could be got wrong.
 //!
-//! **No CPU work runs on the async runtime.** Both point deserialization (which
-//! performs on-curve and subgroup checks per point) and MSM evaluation are
-//! multi-second-to-multi-minute synchronous workloads. Running them in an `async
-//! fn` blocks a tokio worker thread, and enough concurrent requests starve the
-//! whole runtime — including the health endpoints, so an orchestrator cannot even
-//! tell the process is wedged. Everything expensive happens inside
+//! # Data plane endpoints
+//!
+//! Bodies are bincode over `application/octet-stream`. Every request carries
+//! `x-stealthsnark-version`. `/v1/prove` and `/v1/session` also carry
+//! `x-stealthsnark-session`.
+//!
+//! | Method | Path | Purpose |
+//! |---|---|---|
+//! | POST | `/v1/setup` | Upload generators, receive a session token |
+//! | POST | `/v1/prove` | Evaluate the five MSMs |
+//! | DELETE | `/v1/session` | Release generators early |
+//!
+//! # Two structural properties
+//!
+//! **No CPU work runs on the async runtime.** Point deserialization performs
+//! on-curve and subgroup checks per point, and MSM evaluation takes seconds to
+//! minutes. Both in an `async fn` block a tokio worker, and enough concurrent
+//! requests starve the runtime — including the health endpoints, so an
+//! orchestrator cannot tell the process is wedged. Everything expensive runs in
 //! [`tokio::task::spawn_blocking`].
 //!
-//! **Locks are never held across expensive work.** `/prove` takes a read lock
-//! only long enough to clone an `Arc<Session>`. The previous version held the
-//! lock across all five MSMs, so no `/setup` could land while any proof was in
-//! flight.
+//! **Locks are never held across expensive work.** `/v1/prove` takes a read lock
+//! only long enough to clone an `Arc<Session>`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -35,7 +44,7 @@ use ark_bn254::{Fr, G1Affine, G1Projective as G1, G2Affine, G2Projective as G2};
 use ark_ec::CurveGroup;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::Router;
@@ -45,16 +54,21 @@ use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetReques
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
+use super::auth::AuthStore;
 use super::config::ServerConfig;
 use super::error::ApiError;
+use super::extract::{ApiVersion, Caller, OwnedSession};
 use super::messages::*;
 use super::metrics::Metrics;
+use super::quota::QuotaEnforcer;
 use super::session::{Generators, Session, SessionStore};
 
 /// Shared server state. Cheap to clone — every field is behind an `Arc`.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<ServerConfig>,
+    pub auth: Arc<AuthStore>,
+    pub quota: Arc<QuotaEnforcer>,
     pub sessions: Arc<SessionStore>,
     pub metrics: Arc<Metrics>,
     /// Admission control for MSM evaluation. See
@@ -64,11 +78,18 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// State with authentication disabled. For tests and loopback development.
     pub fn new(config: ServerConfig) -> Self {
+        Self::with_auth(config, AuthStore::disabled())
+    }
+
+    pub fn with_auth(config: ServerConfig, auth: AuthStore) -> Self {
         let sessions = Arc::new(SessionStore::new(config.max_sessions, config.session_ttl));
         let msm_slots = Arc::new(Semaphore::new(config.max_concurrent_msm));
         Self {
             config: Arc::new(config),
+            auth: Arc::new(auth),
+            quota: Arc::new(QuotaEnforcer::new()),
             sessions,
             metrics: Arc::new(Metrics::default()),
             msm_slots,
@@ -78,9 +99,9 @@ impl AppState {
 
     /// Wait a bounded time for an MSM slot.
     ///
-    /// Shedding with 503 + `Retry-After` beats queueing indefinitely: a client
-    /// learns immediately that it should back off, rather than discovering it
-    /// after a timeout it cannot distinguish from a crash.
+    /// Shedding with 503 and `Retry-After` beats queueing without limit: a client
+    /// learns at once that it should back off, rather than after a timeout it
+    /// cannot tell apart from a crash.
     async fn acquire_msm_slot(&self) -> Result<OwnedSemaphorePermit, ApiError> {
         if self.shutting_down.load(Ordering::Relaxed) {
             return Err(ApiError::ShuttingDown);
@@ -88,39 +109,72 @@ impl AppState {
         let slots = self.msm_slots.clone();
         match tokio::time::timeout(self.config.admission_wait, slots.acquire_owned()).await {
             Ok(Ok(permit)) => Ok(permit),
-            // Semaphore closed — only happens if the process is tearing down.
+            // The semaphore closes only while the process tears down.
             Ok(Err(_)) => Err(ApiError::ShuttingDown),
             Err(_elapsed) => Err(ApiError::Overloaded),
         }
     }
 
-    fn reject(&self, err: ApiError) -> ApiError {
+    /// Count a refusal, then return it unchanged.
+    pub(crate) fn reject(&self, err: ApiError) -> ApiError {
         self.metrics.record_rejection(&err);
         err
     }
 }
 
-/// Build the router. Exposed separately from [`serve`] so tests can drive the
-/// app without binding a well-known port.
+/// Build the data-plane router: `/v1/*`, authenticated.
 pub fn create_router(state: AppState) -> Router {
     let cfg = state.config.clone();
 
-    Router::new()
+    // The server-wide limit is the hard ceiling; a tier can only be more
+    // restrictive. The quota middleware applies each principal's own smaller
+    // limit afterwards, so a small tier still gets a small cap. `serve` warns if
+    // a tier is configured above this value, because that part of it is
+    // unreachable.
+    let transport_limit = cfg.max_body_bytes;
+
+    let routes = Router::new()
         .route("/v1/setup", post(handle_setup))
         .route("/v1/prove", post(handle_prove))
         .route("/v1/session", delete(handle_release))
+        // Authentication, rate limit, and body-size quota run once for every
+        // route below, so no route can be added without them.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            super::extract::authenticate,
+        ))
+        // axum's default body limit is 2 MiB, which rejects any circuit needing
+        // more than roughly 16k generators per MSM — every circuit worth
+        // outsourcing.
+        .layer(DefaultBodyLimit::max(transport_limit));
+
+    with_common_layers(routes, &cfg).with_state(state)
+}
+
+/// Build the admin-plane router: health and metrics, no credential.
+pub fn create_admin_router(state: AppState) -> Router {
+    let cfg = state.config.clone();
+    let routes = Router::new()
         .route("/livez", get(handle_livez))
         .route("/readyz", get(handle_readyz))
-        .route("/metrics", get(handle_metrics))
-        // The single most consequential line in this file: axum's default body
-        // limit is 2 MiB, which rejects any circuit needing more than ~16k
-        // generators per MSM — i.e. every circuit worth outsourcing.
-        .layer(DefaultBodyLimit::max(cfg.max_body_bytes))
-        // Outermost first: a panic in a handler becomes one 500 rather than a
-        // dead process, and a wedged request cannot occupy a connection forever.
+        .route("/metrics", get(handle_metrics));
+
+    with_common_layers(routes, &cfg).with_state(state)
+}
+
+/// Apply the middleware shared by both planes.
+///
+/// Outermost first: a panicking handler becomes one 500 rather than a dead
+/// process, and a wedged request cannot hold a connection for ever. The request
+/// id is set before `TraceLayer` so that every log line for a request correlates.
+fn with_common_layers<S>(router: Router<S>, cfg: &ServerConfig) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router
         .layer(CatchPanicLayer::new())
-        // 503, not the default 408: a timed-out MSM means the server could not
-        // finish in time, which is a server-side condition the client may retry.
+        // 503 rather than the default 408: a timed-out MSM is a server-side
+        // condition, and the client may retry it.
         .layer(TimeoutLayer::with_status_code(
             StatusCode::SERVICE_UNAVAILABLE,
             cfg.request_timeout,
@@ -128,19 +182,30 @@ pub fn create_router(state: AppState) -> Router {
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(TraceLayer::new_for_http())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-        .with_state(state)
 }
 
-/// Bind, serve, and drain on SIGINT/SIGTERM.
+/// Bind both planes, serve, and drain on SIGINT or SIGTERM.
 pub async fn serve(state: AppState) -> anyhow::Result<()> {
     let cfg = state.config.clone();
 
     tokio::spawn(sweeper(state.clone()));
 
-    let listener = tokio::net::TcpListener::bind(cfg.bind_addr).await?;
-    let local = listener.local_addr()?;
+    let admin = tokio::net::TcpListener::bind(cfg.admin_bind_addr).await?;
+    let admin_addr = admin.local_addr()?;
+
     tracing::info!(
-        addr = %local,
+        data_addr = %cfg.bind_addr,
+        admin_addr = %admin_addr,
+        scheme = cfg.scheme(),
+        auth_mode = ?cfg.auth_mode,
+        mutual_tls = cfg
+            .tls
+            .as_ref()
+            .map(|t| t.client_ca.is_some())
+            .unwrap_or(false),
+        principals = state.auth.principal_count(),
+        api_keys = state.auth.api_key_count(),
+        client_certs = state.auth.client_cert_count(),
         max_body_mib = cfg.max_body_bytes / (1024 * 1024),
         max_sessions = cfg.max_sessions,
         max_concurrent_msm = cfg.max_concurrent_msm,
@@ -149,20 +214,194 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
         "StealthSnark server listening"
     );
 
-    axum::serve(listener, create_router(state.clone()))
-        .with_graceful_shutdown(shutdown_signal(state))
-        .await?;
+    if !cfg.auth_mode.is_enabled() {
+        // Loud, because `validate` only permits this on loopback and an operator
+        // who did not intend it should see it immediately.
+        tracing::warn!("authentication is DISABLED; every caller is the `anonymous` principal");
+    }
+    if !cfg.tls_enabled() {
+        tracing::warn!(
+            "TLS is not configured; the data plane serves plain HTTP and expects a \
+             proxy to terminate TLS"
+        );
+    }
+
+    // A tier above the transport ceiling is not an error, but the operator should
+    // know that the extra allowance can never be used.
+    let widest_tier = state.auth.max_body_bytes_over_tiers();
+    if widest_tier > cfg.max_body_bytes {
+        tracing::warn!(
+            tier_max_body_bytes = widest_tier,
+            transport_max_body_bytes = cfg.max_body_bytes,
+            "a tier allows a larger body than STEALTHSNARK_MAX_BODY_BYTES; \
+             the transport limit binds first"
+        );
+    }
+
+    let shutdown = shutdown_signal(state.clone());
+    let admin_server = axum::serve(admin, create_admin_router(state.clone()))
+        .with_graceful_shutdown(shutdown_flag(state.clone()));
+
+    let data_server = serve_data_plane(state.clone());
+
+    // The admin plane must stay up while the data plane drains, so that a probe
+    // keeps answering during shutdown.
+    let (data_result, admin_result, ()) = tokio::join!(data_server, admin_server, shutdown);
+    admin_result?;
+    data_result?;
 
     tracing::info!("server stopped cleanly");
     Ok(())
 }
 
-/// Resolve when the process is asked to stop, then mark the server unready.
+/// Serve the data plane, with TLS when configured.
+async fn serve_data_plane(state: AppState) -> anyhow::Result<()> {
+    let cfg = state.config.clone();
+    let listener = tokio::net::TcpListener::bind(cfg.bind_addr).await?;
+
+    match &cfg.tls {
+        None => {
+            axum::serve(listener, create_router(state.clone()))
+                .with_graceful_shutdown(shutdown_flag(state))
+                .await?;
+            Ok(())
+        }
+        Some(paths) => {
+            #[cfg(feature = "tls")]
+            {
+                let require_cert = cfg.auth_mode.requires_client_cert();
+                let tls_config = super::tls::server_config(paths, require_cert)?;
+                serve_tls(listener, state, tls_config).await
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                let _ = paths;
+                // `validate` refuses this configuration, so reaching here means a
+                // caller bypassed it.
+                anyhow::bail!("TLS configured but the `tls` feature is not compiled in")
+            }
+        }
+    }
+}
+
+/// TLS accept loop.
 ///
-/// Failing `/readyz` before the listener closes lets a load balancer drain
-/// traffic while in-flight proofs finish. Killing a proof mid-flight is the most
-/// expensive thing that can be thrown away here: the client already paid for a
-/// trusted setup and a multi-hundred-MiB upload.
+/// Hand-rolled because `axum::serve` cannot expose the peer certificate, and mTLS
+/// identity is useless if the handler cannot see who connected. Each accepted
+/// connection completes its handshake, the peer certificate digest goes into the
+/// request extensions, and hyper serves the connection from there.
+#[cfg(feature = "tls")]
+async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    state: AppState,
+    tls_config: rustls::ServerConfig,
+) -> anyhow::Result<()> {
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder as ConnBuilder;
+    use tower::Service;
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+    let router = create_router(state.clone());
+    let connections = Arc::new(tokio::sync::Semaphore::new(1024));
+
+    loop {
+        // Stop accepting as soon as shutdown begins, but let live connections
+        // finish on their own.
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(pair) => pair,
+                Err(e) => {
+                    // A single failed accept must not end the listener.
+                    tracing::warn!(error = %e, "accept failed");
+                    continue;
+                }
+            },
+            () = wait_for_shutdown(state.clone()) => break,
+        };
+
+        let acceptor = acceptor.clone();
+        let router = router.clone();
+        // Bounds the number of half-open TLS handshakes, so a handshake flood
+        // cannot exhaust memory.
+        let Ok(permit) = connections.clone().try_acquire_owned() else {
+            tracing::warn!(%peer, "connection limit reached; dropping");
+            continue;
+        };
+
+        tokio::spawn(async move {
+            let _permit = permit;
+
+            // A handshake timeout is essential: a client that opens a socket and
+            // sends nothing would otherwise hold the slot for ever.
+            let handshake =
+                tokio::time::timeout(std::time::Duration::from_secs(15), acceptor.accept(stream));
+            let tls_stream = match handshake.await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    // `warn`, not `debug`. Under mTLS a rejected handshake means a
+                    // client cannot connect at all, and it is the single most
+                    // likely misconfiguration — a client certificate without the
+                    // `clientAuth` extended key usage, which rustls requires. At
+                    // debug level the operator sees an unreachable service and a
+                    // silent server.
+                    tracing::warn!(%peer, error = %e, "TLS handshake failed");
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(%peer, "TLS handshake timed out");
+                    return;
+                }
+            };
+
+            // rustls has verified the chain against the configured client CA by
+            // this point. The digest only maps a verified certificate to a
+            // principal; it is not itself the trust decision.
+            let cert_digest = super::tls::peer_digest(tls_stream.get_ref().1);
+
+            let io = TokioIo::new(tls_stream);
+            let service = hyper::service::service_fn(move |mut request: axum::http::Request<_>| {
+                if let Some(digest) = cert_digest.clone() {
+                    request
+                        .extensions_mut()
+                        .insert(super::tls::PeerCertDigest(digest));
+                }
+                router.clone().call(request)
+            });
+
+            if let Err(e) = ConnBuilder::new(TokioExecutor::new())
+                .serve_connection_with_upgrades(io, service)
+                .await
+            {
+                tracing::debug!(%peer, error = %e, "connection closed with error");
+            }
+        });
+    }
+
+    tracing::info!("TLS listener stopped accepting new connections");
+    Ok(())
+}
+
+/// Resolve once shutdown has been requested.
+async fn wait_for_shutdown(state: AppState) {
+    loop {
+        if state.shutting_down.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Graceful-shutdown future for an `axum::serve` call.
+async fn shutdown_flag(state: AppState) {
+    wait_for_shutdown(state).await;
+}
+
+/// Wait for a stop signal, then mark the server unready.
+///
+/// `/readyz` fails before the listener closes, so a load balancer drains traffic
+/// while in-flight proofs finish. Cutting a proof short is the most expensive
+/// thing that can be discarded here: the client has already paid for a trusted
+/// setup and a large upload.
 async fn shutdown_signal(state: AppState) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -192,7 +431,7 @@ async fn shutdown_signal(state: AppState) {
     );
 }
 
-/// Periodically release generators held by abandoned sessions.
+/// Release generators held by abandoned sessions, and forget idle rate buckets.
 async fn sweeper(state: AppState) {
     let mut ticker = tokio::time::interval(state.config.sweep_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -201,6 +440,7 @@ async fn sweeper(state: AppState) {
         if state.shutting_down.load(Ordering::Relaxed) {
             return;
         }
+
         let dropped = state.sessions.sweep();
         if dropped > 0 {
             state
@@ -214,19 +454,26 @@ async fn sweeper(state: AppState) {
                 "swept idle sessions"
             );
         }
+
+        // Without this the bucket map grows once per distinct principal and never
+        // shrinks.
+        let forgotten = state.quota.sweep(state.config.quota_bucket_idle);
+        if forgotten > 0 {
+            tracing::debug!(forgotten, "forgot idle rate-limit buckets");
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Handlers
+// Admin handlers
 // ---------------------------------------------------------------------------
 
 async fn handle_livez() -> StatusCode {
     StatusCode::OK
 }
 
-/// Readiness, as distinct from liveness: the process is fine, but it should not
-/// receive more work right now.
+/// Readiness, as distinct from liveness: the process is healthy, but it should
+/// not receive more work now.
 async fn handle_readyz(State(app): State<AppState>) -> Result<&'static str, ApiError> {
     if app.shutting_down.load(Ordering::Relaxed) {
         return Err(ApiError::ShuttingDown);
@@ -243,9 +490,11 @@ async fn handle_metrics(State(app): State<AppState>) -> impl IntoResponse {
         .sessions_evicted
         .store(app.sessions.evicted_total(), Ordering::Relaxed);
 
-    let body = app
-        .metrics
-        .render(app.sessions.len(), app.msm_slots.available_permits());
+    let body = app.metrics.render(
+        app.sessions.len(),
+        app.msm_slots.available_permits(),
+        app.quota.tracked_principals(),
+    );
 
     (
         [(
@@ -256,15 +505,26 @@ async fn handle_metrics(State(app): State<AppState>) -> impl IntoResponse {
     )
 }
 
-/// `POST /v1/setup` — store generators, return a server-issued session token.
+// ---------------------------------------------------------------------------
+// Data-plane handlers
+// ---------------------------------------------------------------------------
+
+/// `POST /v1/setup` — store generators, return a session token.
 async fn handle_setup(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    _version: ApiVersion,
+    Caller(principal): Caller,
     body: Bytes,
 ) -> Result<Bytes, ApiError> {
-    require_version(&headers)?;
+    // Charge the session quota before decoding, so an over-quota caller does not
+    // get megabytes of point validation done for free.
+    let held = app.sessions.count_for(&principal.id);
+    if let Err(e) = app.quota.check_session_allowance(&principal, held) {
+        app.metrics.setup_err.fetch_add(1, Ordering::Relaxed);
+        return Err(app.reject(e));
+    }
 
-    // Decoding generators is heavy (subgroup checks per point), so it consumes an
+    // Decoding generators is heavy (subgroup checks per point), so it takes an
     // admission slot just as proving does.
     let permit = app.acquire_msm_slot().await.map_err(|e| {
         app.metrics.setup_err.fetch_add(1, Ordering::Relaxed);
@@ -290,7 +550,7 @@ async fn handle_setup(
     let counts = generators.counts();
     let resident = generators.resident_bytes();
 
-    let (token, label) = match app.sessions.insert(generators) {
+    let (token, label) = match app.sessions.insert(&principal.id, generators) {
         Ok(pair) => pair,
         Err(e) => {
             app.metrics.setup_err.fetch_add(1, Ordering::Relaxed);
@@ -299,8 +559,11 @@ async fn handle_setup(
     };
 
     app.metrics.setup_ok.fetch_add(1, Ordering::Relaxed);
-    // `label`, never `token`: the token is a bearer credential.
+    // `label`, never `token`: the token is a credential.
     tracing::info!(
+        principal = %principal.id,
+        tier = %principal.tier.name,
+        auth = principal.method.as_str(),
         session = %label,
         h = counts[0], l = counts[1], a = counts[2],
         b_g1 = counts[3], b_g2 = counts[4],
@@ -317,32 +580,20 @@ async fn handle_setup(
     Ok(Bytes::from(encode(&response)?))
 }
 
-/// `POST /v1/prove` — evaluate the five MSMs for an authenticated session.
+/// `POST /v1/prove` — evaluate the five MSMs for an owned session.
 async fn handle_prove(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    _version: ApiVersion,
+    Caller(principal): Caller,
+    owned: OwnedSession,
     body: Bytes,
 ) -> Result<Bytes, ApiError> {
-    require_version(&headers)?;
-    let token = bearer_token(&headers).map_err(|e| {
-        app.metrics.prove_err.fetch_add(1, Ordering::Relaxed);
-        app.reject(e)
-    })?;
-
-    // Short read lock: clone an Arc and release. Never held across the MSMs.
-    let session = match app.sessions.get(&token) {
-        Some(s) => s,
-        None => {
-            app.metrics.prove_err.fetch_add(1, Ordering::Relaxed);
-            return Err(app.reject(ApiError::UnknownSession));
-        }
-    };
-
     let permit = app.acquire_msm_slot().await.map_err(|e| {
         app.metrics.prove_err.fetch_add(1, Ordering::Relaxed);
         app.reject(e)
     })?;
 
+    let session = owned.session;
     let label = session.label.clone();
     let started = Instant::now();
 
@@ -357,7 +608,7 @@ async fn handle_prove(
         Ok(b) => b,
         Err(e) => {
             app.metrics.prove_err.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(session = %label, error = %e, "prove failed");
+            tracing::warn!(principal = %principal.id, session = %label, error = %e, "prove failed");
             return Err(app.reject(e));
         }
     };
@@ -365,6 +616,7 @@ async fn handle_prove(
     let elapsed = started.elapsed();
     app.metrics.record_prove_ok(elapsed);
     tracing::info!(
+        principal = %principal.id,
         session = %label,
         elapsed_ms = elapsed.as_millis() as u64,
         "evaluated 5 MSMs"
@@ -376,65 +628,27 @@ async fn handle_prove(
 /// `DELETE /v1/session` — release generators without waiting for the TTL.
 async fn handle_release(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    _version: ApiVersion,
+    Caller(principal): Caller,
+    owned: OwnedSession,
 ) -> Result<StatusCode, ApiError> {
-    require_version(&headers)?;
-    let token = bearer_token(&headers)?;
+    let released = app
+        .sessions
+        .remove_owned(&owned.token, &principal.id)
+        .map_err(|e| app.reject(e))?;
 
-    match app.sessions.remove(&token) {
-        Some(s) => {
-            tracing::info!(
-                session = %s.label,
-                freed_mib = s.resident_bytes / (1024 * 1024),
-                "session released"
-            );
-            Ok(StatusCode::NO_CONTENT)
-        }
-        None => Err(app.reject(ApiError::UnknownSession)),
-    }
+    tracing::info!(
+        principal = %principal.id,
+        session = %released.label,
+        freed_mib = released.resident_bytes / (1024 * 1024),
+        "session released"
+    );
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------------------
-// Request helpers
+// Encoding helpers
 // ---------------------------------------------------------------------------
-
-/// Reject a client that does not speak this protocol version.
-///
-/// bincode is not self-describing, so a struct that gained a field decodes as
-/// *something* rather than failing. Without this check that is silent corruption;
-/// with it, it is a clear 400.
-fn require_version(headers: &HeaderMap) -> Result<(), ApiError> {
-    let raw = headers
-        .get(VERSION_HEADER)
-        .ok_or_else(|| ApiError::UnsupportedVersion {
-            got: "<missing>".to_string(),
-        })?;
-    let text = raw.to_str().map_err(|_| ApiError::UnsupportedVersion {
-        got: "<non-ascii>".to_string(),
-    })?;
-    match text.trim().parse::<u32>() {
-        Ok(v) if v == PROTOCOL_VERSION => Ok(()),
-        _ => Err(ApiError::UnsupportedVersion {
-            got: text.to_string(),
-        }),
-    }
-}
-
-fn bearer_token(headers: &HeaderMap) -> Result<String, ApiError> {
-    let raw = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .ok_or(ApiError::MissingToken)?;
-    let text = raw.to_str().map_err(|_| ApiError::MissingToken)?;
-    let token = text
-        .strip_prefix("Bearer ")
-        .or_else(|| text.strip_prefix("bearer "))
-        .ok_or(ApiError::MissingToken)?
-        .trim();
-    if token.is_empty() {
-        return Err(ApiError::MissingToken);
-    }
-    Ok(token.to_string())
-}
 
 fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, ApiError> {
     bincode::serialize(value)
@@ -513,55 +727,6 @@ fn evaluate_msms(session: &Session, body: &[u8]) -> Result<Vec<u8>, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
-
-    fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        for (k, v) in pairs {
-            h.insert(
-                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
-                HeaderValue::from_str(v).unwrap(),
-            );
-        }
-        h
-    }
-
-    #[test]
-    fn version_header_is_required_and_checked() {
-        assert!(require_version(&headers_with(&[(VERSION_HEADER, "1")])).is_ok());
-
-        let missing = require_version(&HeaderMap::new()).unwrap_err();
-        assert_eq!(missing.code(), "unsupported_version");
-        assert!(missing.to_string().contains("<missing>"));
-
-        for bad in ["0", "2", "abc", ""] {
-            let e = require_version(&headers_with(&[(VERSION_HEADER, bad)])).unwrap_err();
-            assert_eq!(e.code(), "unsupported_version", "accepted version {bad:?}");
-        }
-    }
-
-    #[test]
-    fn bearer_token_parsing() {
-        let ok = headers_with(&[("authorization", "Bearer deadbeef")]);
-        assert_eq!(bearer_token(&ok).unwrap(), "deadbeef");
-
-        // Lowercase scheme is tolerated; anything else is not a credential.
-        let lower = headers_with(&[("authorization", "bearer deadbeef")]);
-        assert_eq!(bearer_token(&lower).unwrap(), "deadbeef");
-
-        for bad in ["deadbeef", "Basic deadbeef", "Bearer ", "Bearer    "] {
-            let h = headers_with(&[("authorization", bad)]);
-            assert_eq!(
-                bearer_token(&h).unwrap_err().code(),
-                "missing_token",
-                "accepted {bad:?} as a token"
-            );
-        }
-        assert_eq!(
-            bearer_token(&HeaderMap::new()).unwrap_err().code(),
-            "missing_token"
-        );
-    }
 
     #[test]
     fn malformed_setup_body_is_a_400_not_a_panic() {
@@ -582,7 +747,7 @@ mod tests {
         });
 
         let held = app.acquire_msm_slot().await.unwrap();
-        // Second request finds no slot and is shed rather than parked forever.
+        // A second request finds no slot and is shed rather than parked for ever.
         let err = app.acquire_msm_slot().await.unwrap_err();
         assert_eq!(err.code(), "overloaded");
         assert!(err.is_retryable());
@@ -612,7 +777,7 @@ mod tests {
         assert!(handle_readyz(State(app.clone())).await.is_ok());
         let _held = app.acquire_msm_slot().await.unwrap();
 
-        // Saturated: not ready, but definitely alive.
+        // Saturated: not ready, but certainly alive.
         let err = handle_readyz(State(app.clone())).await.unwrap_err();
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(handle_livez().await, StatusCode::OK);

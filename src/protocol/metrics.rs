@@ -34,6 +34,18 @@ pub struct Metrics {
     pub rejected_unknown_session: AtomicU64,
     pub sessions_evicted: AtomicU64,
 
+    /// Requests refused for a missing or invalid client credential.
+    ///
+    /// A sustained rise here is the signal of a credential-guessing attempt.
+    pub rejected_unauthenticated: AtomicU64,
+    /// Requests refused because the credential did not reach the resource, which
+    /// in practice means one principal presented another's session token.
+    pub rejected_forbidden: AtomicU64,
+    /// Requests refused by a per-principal rate limit.
+    pub rejected_rate_limited: AtomicU64,
+    /// Requests refused because a body exceeded the principal's tier.
+    pub rejected_body_too_large: AtomicU64,
+
     /// Malicious-mode consistency check failures. Non-zero means a server
     /// returned inconsistent MSM results. Alert on any increase.
     pub consistency_check_failures: AtomicU64,
@@ -53,20 +65,32 @@ impl Metrics {
         use super::error::ApiError as E;
         match err {
             E::Overloaded | E::ShuttingDown => &self.rejected_overloaded,
+            // Server-wide cap and per-principal quota are counted apart: the
+            // first says the host is full, the second says one client is.
             E::SessionLimit => &self.rejected_session_limit,
+            E::SessionQuotaExceeded { .. } => &self.rejected_session_limit,
             E::UnknownSession | E::MissingToken => &self.rejected_unknown_session,
+            E::Unauthenticated(_) => &self.rejected_unauthenticated,
+            E::Forbidden(_) => &self.rejected_forbidden,
+            E::RateLimited { .. } => &self.rejected_rate_limited,
+            E::BodyTooLarge { .. } => &self.rejected_body_too_large,
             _ => return,
         }
         .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Render Prometheus text format. `active_sessions` and `msm_slots_free` are
-    /// live gauges passed in by the caller rather than stored here.
-    pub fn render(&self, active_sessions: usize, msm_slots_free: usize) -> String {
+    /// Render Prometheus text format. The gauges are live values passed in by the
+    /// caller rather than stored here.
+    pub fn render(
+        &self,
+        active_sessions: usize,
+        msm_slots_free: usize,
+        tracked_principals: usize,
+    ) -> String {
         let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
-        let mut out = String::with_capacity(2048);
+        let mut out = String::with_capacity(4096);
 
-        let counters: [(&str, &str, u64); 10] = [
+        let counters: [(&str, &str, u64); 14] = [
             (
                 "stealthsnark_setup_requests_ok_total",
                 "Successful /v1/setup requests.",
@@ -117,6 +141,26 @@ impl Metrics {
                 "Malicious-mode consistency check failures. Non-zero means a server cheated.",
                 g(&self.consistency_check_failures),
             ),
+            (
+                "stealthsnark_rejected_unauthenticated_total",
+                "Requests refused for a missing or invalid client credential.",
+                g(&self.rejected_unauthenticated),
+            ),
+            (
+                "stealthsnark_rejected_forbidden_total",
+                "Requests refused because a session token belonged to another principal.",
+                g(&self.rejected_forbidden),
+            ),
+            (
+                "stealthsnark_rejected_rate_limited_total",
+                "Requests refused by a per-principal rate limit.",
+                g(&self.rejected_rate_limited),
+            ),
+            (
+                "stealthsnark_rejected_body_too_large_total",
+                "Requests refused because the body exceeded the principal's tier limit.",
+                g(&self.rejected_body_too_large),
+            ),
         ];
 
         for (name, help, value) in counters {
@@ -125,7 +169,12 @@ impl Metrics {
             let _ = writeln!(out, "{name} {value}");
         }
 
-        let gauges: [(&str, &str, u64); 3] = [
+        let gauges: [(&str, &str, u64); 4] = [
+            (
+                "stealthsnark_tracked_principals",
+                "Principals with a live rate-limit bucket.",
+                tracked_principals as u64,
+            ),
             (
                 "stealthsnark_active_sessions",
                 "Sessions currently holding generators in memory.",
@@ -161,17 +210,44 @@ mod tests {
     fn render_is_valid_prometheus_shape() {
         let m = Metrics::default();
         m.record_prove_ok(Duration::from_millis(5));
-        let text = m.render(3, 1);
+        let text = m.render(3, 1, 2);
 
         assert!(text.contains("stealthsnark_prove_requests_ok_total 1"));
         assert!(text.contains("stealthsnark_active_sessions 3"));
         assert!(text.contains("stealthsnark_msm_slots_free 1"));
+        assert!(text.contains("stealthsnark_tracked_principals 2"));
         assert!(text.contains("stealthsnark_prove_duration_micros_total 5000"));
         // Every metric line must be preceded by HELP and TYPE metadata.
         let helps = text.matches("# HELP ").count();
         let types = text.matches("# TYPE ").count();
         assert_eq!(helps, types);
-        assert_eq!(helps, 13);
+        assert_eq!(helps, 18);
+    }
+
+    #[test]
+    fn auth_and_quota_rejections_are_counted_apart() {
+        use super::super::error::ApiError;
+        let m = Metrics::default();
+        m.record_rejection(&ApiError::Unauthenticated("x".into()));
+        m.record_rejection(&ApiError::Forbidden("x".into()));
+        m.record_rejection(&ApiError::RateLimited {
+            retry_after_secs: 1,
+        });
+        m.record_rejection(&ApiError::BodyTooLarge {
+            limit_bytes: 1,
+            got_bytes: 2,
+        });
+
+        assert_eq!(m.rejected_unauthenticated.load(Ordering::Relaxed), 1);
+        assert_eq!(m.rejected_forbidden.load(Ordering::Relaxed), 1);
+        assert_eq!(m.rejected_rate_limited.load(Ordering::Relaxed), 1);
+        assert_eq!(m.rejected_body_too_large.load(Ordering::Relaxed), 1);
+
+        // A per-principal quota refusal and the server-wide cap share a counter
+        // deliberately: both mean "no new session right now".
+        m.record_rejection(&ApiError::SessionQuotaExceeded { limit: 1 });
+        m.record_rejection(&ApiError::SessionLimit);
+        assert_eq!(m.rejected_session_limit.load(Ordering::Relaxed), 2);
     }
 
     #[test]

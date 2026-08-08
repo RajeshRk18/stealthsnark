@@ -96,6 +96,12 @@ pub struct Session {
     /// The token is a bearer credential, so it must never reach a log sink; this
     /// label exists so that requests remain traceable without leaking it.
     pub label: String,
+    /// Id of the principal that created this session.
+    ///
+    /// This is what makes the session token second-factor rather than sufficient:
+    /// [`SessionStore::get_owned`] refuses a token presented by any other
+    /// principal, so a leaked token is useless without the owner's credential.
+    pub owner: String,
     pub generators: Generators,
     pub resident_bytes: usize,
     /// Milliseconds since the store's epoch at last successful lookup.
@@ -105,6 +111,22 @@ pub struct Session {
 impl Session {
     fn touch(&self, now_ms: u64) {
         self.last_seen_ms.store(now_ms, Ordering::Relaxed);
+    }
+}
+
+/// Hand-written to print a summary.
+///
+/// A derived implementation would dump every generator — millions of curve points
+/// for a real circuit — which turns one stray `{:?}` into an unusable log and a
+/// memory spike. Counts carry all the diagnostic value.
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("label", &self.label)
+            .field("owner", &self.owner)
+            .field("generator_counts", &self.generators.counts())
+            .field("resident_bytes", &self.resident_bytes)
+            .finish()
     }
 }
 
@@ -137,7 +159,11 @@ impl SessionStore {
     /// The token is freshly minted from the OS CSPRNG; the client has no say in
     /// it. Expired sessions are swept first so that a full map caused purely by
     /// abandoned sessions does not reject a legitimate new one.
-    pub fn insert(&self, generators: Generators) -> Result<(String, String), ApiError> {
+    pub fn insert(
+        &self,
+        owner: &str,
+        generators: Generators,
+    ) -> Result<(String, String), ApiError> {
         self.sweep();
 
         let resident_bytes = generators.resident_bytes();
@@ -146,6 +172,7 @@ impl SessionStore {
 
         let session = Arc::new(Session {
             label: label.clone(),
+            owner: owner.to_string(),
             generators,
             resident_bytes,
             last_seen_ms: AtomicU64::new(self.now_ms()),
@@ -178,9 +205,53 @@ impl SessionStore {
         Some(session.clone())
     }
 
+    /// Look up a session and require that `principal_id` owns it.
+    ///
+    /// Ownership is checked separately from existence, and the two produce
+    /// different errors on purpose. An unknown token is a 401 — the credential
+    /// may simply be stale. A valid token belonging to somebody else is a 403,
+    /// because no retry with the same identity can ever succeed.
+    pub fn get_owned(&self, token: &str, principal_id: &str) -> Result<Arc<Session>, ApiError> {
+        let session = self.get(token).ok_or(ApiError::UnknownSession)?;
+        if session.owner != principal_id {
+            // The log records the mismatch; the client is told nothing about the
+            // real owner.
+            tracing::warn!(
+                session = %session.label,
+                owner = %session.owner,
+                presented_by = %principal_id,
+                "session token presented by a different principal"
+            );
+            return Err(ApiError::Forbidden(
+                "this session belongs to another client".to_string(),
+            ));
+        }
+        Ok(session)
+    }
+
     /// Explicitly drop a session. Returns whether it existed.
     pub fn remove(&self, token: &str) -> Option<Arc<Session>> {
         self.write().remove(token)
+    }
+
+    /// Remove a session only if `principal_id` owns it.
+    pub fn remove_owned(&self, token: &str, principal_id: &str) -> Result<Arc<Session>, ApiError> {
+        // Resolve ownership first, so a wrong principal cannot delete a session
+        // it does not own.
+        self.get_owned(token, principal_id)?;
+        self.remove(token).ok_or(ApiError::UnknownSession)
+    }
+
+    /// Live sessions held by one principal, for quota accounting.
+    ///
+    /// Expired-but-unswept sessions are excluded, so a principal is not charged
+    /// for allowance it no longer holds.
+    pub fn count_for(&self, principal_id: &str) -> usize {
+        let now = self.now_ms();
+        self.read()
+            .values()
+            .filter(|s| s.owner == principal_id && !self.is_expired(s, now))
+            .count()
     }
 
     /// Evict every session past its idle TTL. Returns how many were dropped.
@@ -263,7 +334,7 @@ mod tests {
         let s = store(100, 60_000);
         let mut seen = std::collections::HashSet::new();
         for _ in 0..64 {
-            let (token, label) = s.insert(tiny_generators()).unwrap();
+            let (token, label) = s.insert("owner", tiny_generators()).unwrap();
             assert_eq!(
                 token.len(),
                 TOKEN_BYTES * 2,
@@ -281,8 +352,8 @@ mod tests {
         // The hijack that the old client-chosen session_id allowed: two setups
         // must yield two independent sessions, never a replacement.
         let s = store(100, 60_000);
-        let (token_a, _) = s.insert(tiny_generators()).unwrap();
-        let (token_b, _) = s.insert(tiny_generators()).unwrap();
+        let (token_a, _) = s.insert("owner", tiny_generators()).unwrap();
+        let (token_b, _) = s.insert("owner", tiny_generators()).unwrap();
         assert_ne!(token_a, token_b);
         assert_eq!(s.len(), 2);
         assert!(s.get(&token_a).is_some());
@@ -292,7 +363,7 @@ mod tests {
     #[test]
     fn unknown_token_is_refused() {
         let s = store(100, 60_000);
-        s.insert(tiny_generators()).unwrap();
+        s.insert("owner", tiny_generators()).unwrap();
         assert!(s.get("not-a-real-token").is_none());
         assert!(s.get("").is_none());
     }
@@ -300,9 +371,9 @@ mod tests {
     #[test]
     fn capacity_is_enforced() {
         let s = store(2, 60_000);
-        s.insert(tiny_generators()).unwrap();
-        s.insert(tiny_generators()).unwrap();
-        let err = s.insert(tiny_generators()).unwrap_err();
+        s.insert("owner", tiny_generators()).unwrap();
+        s.insert("owner", tiny_generators()).unwrap();
+        let err = s.insert("owner", tiny_generators()).unwrap_err();
         assert_eq!(err.code(), "session_limit");
         assert_eq!(s.len(), 2, "a refused insert must not grow the map");
     }
@@ -310,7 +381,7 @@ mod tests {
     #[test]
     fn idle_sessions_expire_and_free_memory() {
         let s = store(100, 0); // everything older than 0ms is expired
-        let (token, _) = s.insert(tiny_generators()).unwrap();
+        let (token, _) = s.insert("owner", tiny_generators()).unwrap();
         std::thread::sleep(Duration::from_millis(5));
 
         assert!(s.get(&token).is_none(), "expired session must not resolve");
@@ -322,7 +393,7 @@ mod tests {
     #[test]
     fn active_use_refreshes_the_idle_timer() {
         let s = store(100, 200);
-        let (token, _) = s.insert(tiny_generators()).unwrap();
+        let (token, _) = s.insert("owner", tiny_generators()).unwrap();
         for _ in 0..4 {
             std::thread::sleep(Duration::from_millis(60));
             assert!(s.get(&token).is_some(), "in-use session was evicted");
@@ -334,7 +405,7 @@ mod tests {
     #[test]
     fn explicit_release_frees_immediately() {
         let s = store(100, 60_000);
-        let (token, _) = s.insert(tiny_generators()).unwrap();
+        let (token, _) = s.insert("owner", tiny_generators()).unwrap();
         assert!(s.remove(&token).is_some());
         assert!(s.is_empty());
         assert!(s.remove(&token).is_none(), "double release must be a no-op");
@@ -344,12 +415,92 @@ mod tests {
     fn capacity_refusal_does_not_outlive_expiry() {
         // A map full of abandoned sessions must not reject a legitimate new one.
         let s = store(1, 0);
-        s.insert(tiny_generators()).unwrap();
+        s.insert("owner", tiny_generators()).unwrap();
         std::thread::sleep(Duration::from_millis(5));
         assert!(
-            s.insert(tiny_generators()).is_ok(),
+            s.insert("owner", tiny_generators()).is_ok(),
             "insert must sweep expired sessions before refusing on capacity"
         );
+    }
+
+    #[test]
+    fn a_session_token_is_useless_to_another_principal() {
+        // This is what makes the session token a second factor rather than a
+        // sufficient credential. Even with the exact token, a different principal
+        // cannot use it.
+        let s = store(100, 60_000);
+        let (token, _) = s.insert("alice", tiny_generators()).unwrap();
+
+        assert!(s.get_owned(&token, "alice").is_ok());
+
+        let err = s.get_owned(&token, "bob").unwrap_err();
+        assert_eq!(err.code(), "forbidden");
+        assert_eq!(err.status(), axum::http::StatusCode::FORBIDDEN);
+        assert!(!err.is_retryable(), "bob retrying as bob can never succeed");
+
+        // The message must not disclose the real owner.
+        assert!(!err.to_string().contains("alice"));
+    }
+
+    #[test]
+    fn ownership_and_existence_produce_different_errors() {
+        let s = store(100, 60_000);
+        let (token, _) = s.insert("alice", tiny_generators()).unwrap();
+
+        // Unknown token: 401, because the credential may merely be stale.
+        assert_eq!(
+            s.get_owned("00".repeat(32).as_str(), "alice")
+                .unwrap_err()
+                .code(),
+            "unknown_session"
+        );
+        // Real token, wrong owner: 403, because no retry can help.
+        assert_eq!(s.get_owned(&token, "bob").unwrap_err().code(), "forbidden");
+    }
+
+    #[test]
+    fn only_the_owner_can_release_a_session() {
+        let s = store(100, 60_000);
+        let (token, _) = s.insert("alice", tiny_generators()).unwrap();
+
+        assert_eq!(
+            s.remove_owned(&token, "bob").unwrap_err().code(),
+            "forbidden"
+        );
+        assert_eq!(s.len(), 1, "a refused release must not delete the session");
+
+        assert!(s.remove_owned(&token, "alice").is_ok());
+        assert!(s.is_empty());
+        assert_eq!(
+            s.remove_owned(&token, "alice").unwrap_err().code(),
+            "unknown_session",
+            "double release must not succeed"
+        );
+    }
+
+    #[test]
+    fn sessions_are_counted_per_principal_for_quota() {
+        let s = store(100, 60_000);
+        s.insert("alice", tiny_generators()).unwrap();
+        s.insert("alice", tiny_generators()).unwrap();
+        s.insert("bob", tiny_generators()).unwrap();
+
+        assert_eq!(s.count_for("alice"), 2);
+        assert_eq!(s.count_for("bob"), 1);
+        assert_eq!(s.count_for("carol"), 0);
+        assert_eq!(s.len(), 3);
+    }
+
+    #[test]
+    fn expired_sessions_do_not_count_against_quota() {
+        // A principal must not be charged for allowance it no longer holds, even
+        // before the sweeper has run.
+        let s = store(100, 0);
+        s.insert("alice", tiny_generators()).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(s.count_for("alice"), 0);
+        // The entry is still physically present until the sweep.
+        assert_eq!(s.len(), 1);
     }
 
     #[test]
@@ -368,7 +519,7 @@ mod tests {
         assert_eq!(g.resident_bytes(), expected);
         assert_eq!(g.counts(), [10, 0, 0, 0, 4]);
 
-        s.insert(g).unwrap();
+        s.insert("owner", g).unwrap();
         assert_eq!(s.resident_bytes(), expected);
     }
 }

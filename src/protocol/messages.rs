@@ -6,11 +6,25 @@ use serde::{Deserialize, Serialize};
 /// bincode is not self-describing: if a message struct gains a field, an older
 /// peer decodes the bytes as *something* rather than failing. An explicit version
 /// turns that silent corruption into a clean rejection. Bump this whenever any
-/// type in this module changes shape.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// type in this module changes shape, or whenever a header changes meaning.
+///
+/// Version 2 moved the session token out of `Authorization` and into
+/// [`SESSION_HEADER`], because `Authorization` now carries the client credential.
+/// A version 1 client therefore sends its session token where the server expects
+/// an API key; the version check turns that into a clear rejection instead of a
+/// confusing authentication failure.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Header carrying [`PROTOCOL_VERSION`].
 pub const VERSION_HEADER: &str = "x-stealthsnark-version";
+
+/// Header carrying the session token issued by `/v1/setup`.
+///
+/// Separate from `Authorization` on purpose. `Authorization` says *who you are*
+/// (an API key, or a TLS client certificate); this says *which stored generators
+/// you mean*. Keeping them apart is what lets the server bind a session to its
+/// owner, so a stolen session token is useless without the owner's credential.
+pub const SESSION_HEADER: &str = "x-stealthsnark-session";
 
 /// Maximum number of elements allowed in a deserialized vector.
 /// Prevents unbounded allocation from attacker-controlled length prefixes.
