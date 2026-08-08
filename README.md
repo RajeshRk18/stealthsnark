@@ -171,9 +171,17 @@ an already-verified certificate to a principal. A certificate the CA signed but
 the auth file does not list is refused — the CA decides who may connect, and this
 service decides who is a principal.
 
-A client certificate **must carry the `clientAuth` extended key usage**. rustls
-requires it, and a certificate without it fails the handshake. This is the most
-common mTLS misconfiguration, so the server logs every failed handshake at `warn`.
+A client certificate **must be X.509 v3**. rustls rejects a v1 certificate with
+`UnsupportedCertVersion`, and `openssl x509 -req` emits v1 unless you pass
+`-extfile` with at least one extension:
+
+```sh
+openssl x509 -req -in client.csr -CA ca.pem -CAkey ca.key -out client.pem -days 365 \
+  -extfile <(printf "basicConstraints=CA:FALSE\nextendedKeyUsage=clientAuth")
+```
+
+The server logs every failed handshake at `warn`, because the rustls error text is
+the only thing that says why a client cannot connect.
 
 The demo client reads its credentials from the environment:
 

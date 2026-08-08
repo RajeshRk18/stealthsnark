@@ -339,11 +339,14 @@ async fn serve_tls(
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
                     // `warn`, not `debug`. Under mTLS a rejected handshake means a
-                    // client cannot connect at all, and it is the single most
-                    // likely misconfiguration — a client certificate without the
-                    // `clientAuth` extended key usage, which rustls requires. At
-                    // debug level the operator sees an unreachable service and a
-                    // silent server.
+                    // client cannot connect at all, and the rustls error text is
+                    // the only thing that says why. At debug level an operator
+                    // sees an unreachable service and a silent server.
+                    //
+                    // Observed example: `UnsupportedCertVersion`, from a client
+                    // certificate built by `openssl x509 -req` with no `-extfile`.
+                    // That emits an X.509 v1 certificate, which rustls rejects;
+                    // adding any extension promotes it to v3.
                     tracing::warn!(%peer, error = %e, "TLS handshake failed");
                     return;
                 }
