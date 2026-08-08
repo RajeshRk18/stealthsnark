@@ -24,6 +24,11 @@ The server is the adversary. Two modes are supported and tested:
 | **DoS / panic safety** | crash or OOM on malformed bytes | fuzz `vec_deser`, `message_parsing` | libFuzzer |
 | **Session isolation** | one session's generators leak into another | `session_stress.rs` | per-key verify under concurrency |
 | **Session authenticity** | a client acts on a session it was not issued | `service_hardening.rs`, `session.rs` unit tests | server-issued 256-bit tokens |
+| **Client authentication** | an unregistered caller reaches a `/v1` route | `auth_quota.rs`, `auth.rs` unit tests | every route probed with no credential |
+| **Session ownership** | a leaked token works without its owner's credential | `auth_quota.rs` | a second principal replays the token |
+| **Quota isolation** | one client consumes another's allowance | `auth_quota.rs`, `quota.rs` unit tests | two principals, one floods |
+| **Transport security** | TLS does not verify, or mTLS identity is forgeable | `tls_mtls.rs` | real handshakes against a throwaway CA |
+| **Credential secrecy** | a key or token reaches a log or the auth file | `auth.rs`, `secret.rs` unit tests | digest-only storage, redacting `Debug` |
 | **Servable circuit size** | the transport silently rejects every useful circuit | `service_hardening.rs` | payload above the old 2 MiB ceiling |
 | **Bounded memory** | abandoned sessions pin generators forever | `service_hardening.rs`, `session.rs` unit tests | TTL eviction + session cap |
 | **Diagnosability** | distinct failures are indistinguishable to a client | `service_hardening.rs` | stable machine-readable error codes |
@@ -85,6 +90,45 @@ Integration suites (in `tests/`):
   axum's default 2 MiB body limit made the service unable to accept any circuit
   large enough to be worth outsourcing. Correctness oracles cannot see a
   capacity ceiling; only a realistically-sized payload can.
+
+- **`auth_quota.rs`** — client authentication and per-principal quota over HTTP.
+  The unit tests in `protocol::auth` and `protocol::quota` check the rules in
+  isolation; these check the rules are *wired in*. A route mounted outside the
+  authenticate layer, or a handler that forgot to charge quota, passes every unit
+  test and fails here.
+
+  | Test | Property |
+  |---|---|
+  | `every_data_plane_route_requires_a_credential` | no route serves an anonymous caller; 401 carries `WWW-Authenticate` |
+  | `api_keys_are_verified` | a tampered secret and an unknown key id both fail, with the same message |
+  | `a_session_token_is_useless_to_another_principal` | wrong owner ⇒ 403, and cannot release either |
+  | `rate_limit_is_enforced_per_principal` | burst then 429 + `Retry-After`; a second principal is unaffected |
+  | `session_quota_is_enforced_per_principal` | tier cap binds, and releasing restores the allowance |
+  | `body_size_quota_is_enforced_per_tier` | 413 below the server-wide transport limit |
+  | `unauthenticated_traffic_does_not_spend_a_principals_allowance` | check order: authenticate before charging quota |
+  | `the_client_completes_a_session_with_an_api_key` | the real client flow verifies a proof end to end |
+
+- **`tls_mtls.rs`** — real handshakes, because the mTLS identity path cannot be
+  checked any other way: whether rustls verified the chain, and whether the
+  resulting certificate digest reaches the middleware, only becomes true after a
+  handshake completes. A throwaway CA, server certificate, and two client
+  certificates are generated in memory by `rcgen`, so no private key is committed.
+  Gated on `#![cfg(feature = "tls")]`.
+
+  | Test | Property |
+  |---|---|
+  | `tls_serves_a_client_that_trusts_the_ca` | TLS works end to end |
+  | `tls_rejects_a_client_that_does_not_trust_the_ca` | verification is real — if this passes, it is not happening |
+  | `mtls_authenticates_a_registered_certificate` | identity from the handshake, no header |
+  | `mtls_refuses_an_unregistered_certificate` | a valid chain is necessary but not sufficient |
+  | `mtls_requires_a_certificate` | mTLS-only refuses at the handshake |
+  | `any_mode_accepts_a_certificate_or_a_key` | optional client auth, so a key client still connects |
+  | `mtls_identity_is_bound_to_its_sessions` | ownership holds regardless of how identity was proved |
+
+  Worth recording: the first run of this suite failed with `KeyMismatch` and
+  `BadSignature` because every test shared one PKI directory and parallel runs
+  overwrote each other's keys. The symptom looked like a cryptographic fault and
+  was a test-isolation bug.
 
 ### 2. Benchmarks (`cargo bench`)
 

@@ -27,20 +27,32 @@ check them (see `VERIFICATION.md`):
 | Correctness | Server-aided proofs match stock `ark-groth16` | `tests/differential.rs` |
 | Availability | Untrusted input cannot panic, OOM, or wedge the server | `tests/service_hardening.rs`, `cargo fuzz` |
 | Session isolation | One client cannot read, replace, or corrupt another's session | `tests/service_hardening.rs`, `tests/session_stress.rs` |
+| Client authentication | An unregistered caller cannot reach any `/v1` route | `tests/auth_quota.rs`, `tests/tls_mtls.rs` |
+| Session ownership | A leaked session token is useless without its owner's credential | `tests/auth_quota.rs` |
+| Quota isolation | One client cannot consume another's rate or session allowance | `tests/auth_quota.rs` |
+| Transport security | TLS is real, and mTLS identity is bound to a verified chain | `tests/tls_mtls.rs` |
+| Credential handling | No key or token reaches a log; digests only in the auth file | `protocol::secret`, `protocol::auth` tests |
 
 ## What is explicitly out of scope
 
 These are known, deliberate limitations rather than bugs. Reports about them are
 welcome as discussion, but they are not vulnerabilities in the current design.
 
-- **No transport security.** The server speaks plain HTTP and does not
-  authenticate clients beyond the per-session bearer token it issues. Terminate
-  TLS at a reverse proxy and put an authenticating layer in front of it. LPN
-  masking protects witness *confidentiality* on the wire, but nothing in this
-  repo protects *integrity* of the transport.
-- **No client authentication or quota.** Anyone who can reach `/v1/setup` can
-  consume a session slot. `STEALTHSNARK_MAX_SESSIONS` bounds the damage; it does
-  not attribute it.
+- **Plain HTTP when TLS is not configured.** TLS and mTLS are supported in-process
+  (`STEALTHSNARK_TLS_*`), and a reverse proxy that terminates TLS is equally
+  valid. Neither is the default, so a deployment that configures neither is
+  unencrypted. LPN masking still protects witness *confidentiality* on the wire,
+  but nothing protects transport *integrity* without TLS.
+- **Certificate pinning by digest.** A client is identified under mTLS by the
+  SHA-256 of its certificate. A renewed certificate is a new identity and must be
+  re-registered. That is deliberate for pinning, but it means certificate rotation
+  is an operational step, not an automatic one.
+- **Long-lived API keys with no rotation or revocation flow.** Removing a record
+  from the auth file revokes a key, but that requires a restart; there is no
+  online revocation and no expiry.
+- **Quota is per process, not per cluster.** Rate-limit buckets and session counts
+  live in memory. Two instances behind a load balancer each enforce the full quota,
+  so a principal effectively gets double.
 - **Semi-honest mode trusts the server's arithmetic.** Only the malicious-secure
   path (`malicious_*`) detects a cheating server. Using semi-honest mode against
   an untrusted server is a misuse, not a vulnerability.
@@ -59,7 +71,18 @@ welcome as discussion, but they are not vulnerabilities in the current design.
 Defaults are chosen to fail safe rather than to be convenient:
 
 - Binds `127.0.0.1` by default, not `0.0.0.0`. Exposing it is a deliberate act.
-- Session generators are evicted after an idle TTL and capped in count.
+- **Startup refuses to bind a routable address with authentication disabled.** No
+  missing environment variable can produce an open service on a network interface.
+- The admin plane, which serves `/metrics`, must bind loopback. Startup fails
+  otherwise.
+- `mtls` without TLS, or without a client CA, is a startup error rather than a
+  silent fallback to no authentication.
+- TLS configured in a binary built without the `tls` feature is a startup error,
+  never a silent downgrade to plain HTTP.
+- API keys are stored as SHA-256 digests and compared in constant time. A wrong
+  secret and an unknown key id return the same message.
+- Session generators are evicted after an idle TTL and capped in count, both
+  per process and per principal.
 - Request bodies are capped; the cap times the MSM concurrency is the worst-case
   memory from in-flight bodies, and the server logs that product at startup.
 
