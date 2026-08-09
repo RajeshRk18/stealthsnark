@@ -26,7 +26,11 @@ impl<F: Field> DualLPNInstance<F> {
 
     /// Mask a witness vector z: returns v = z + r
     pub fn mask_witness(&self, z: &[F]) -> Vec<F> {
-        assert_eq!(z.len(), self.lpn_vector.len(), "z must have same length as lpn_vector");
+        assert_eq!(
+            z.len(),
+            self.lpn_vector.len(),
+            "z must have same length as lpn_vector"
+        );
         z.iter()
             .zip(self.lpn_vector.iter())
             .map(|(zi, ri)| *zi + *ri)

@@ -91,9 +91,8 @@ mod tests {
         let public_inputs = get_public_inputs(&circuit).expect("no public inputs");
 
         // Encrypt → server evaluate → decrypt
-        let (request, state) =
-            client_encrypt::<CircomReduction, _, _>(&sapk, circuit, &mut rng)
-                .expect("encrypt failed");
+        let (request, state) = client_encrypt::<CircomReduction, _, _>(&sapk, circuit, &mut rng)
+            .expect("encrypt failed");
         let response = server_evaluate(&sapk, &request).expect("server evaluate failed");
         let proof = client_decrypt(&sapk, &response, &state);
 
@@ -117,25 +116,23 @@ mod tests {
         let sapk = ServerAidedProvingKey::setup(pk, &mut rng);
 
         // Build circuit with witness: value=200 (fits in 8 bits, 0..255)
-        let circuit = build_circuit(
-            RANGE_CHECK_WASM,
-            RANGE_CHECK_R1CS,
-            &[("value", 200.into())],
-        )
-        .expect("build circuit failed");
+        let circuit = build_circuit(RANGE_CHECK_WASM, RANGE_CHECK_R1CS, &[("value", 200.into())])
+            .expect("build circuit failed");
 
         let public_inputs = get_public_inputs(&circuit).expect("no public inputs");
 
         // Encrypt → server evaluate → decrypt
-        let (request, state) =
-            client_encrypt::<CircomReduction, _, _>(&sapk, circuit, &mut rng)
-                .expect("encrypt failed");
+        let (request, state) = client_encrypt::<CircomReduction, _, _>(&sapk, circuit, &mut rng)
+            .expect("encrypt failed");
         let response = server_evaluate(&sapk, &request).expect("server evaluate failed");
         let proof = client_decrypt(&sapk, &response, &state);
 
         // Verify
         let valid = Groth16::<Bn254, CircomReduction>::verify(&vk, &public_inputs, &proof)
             .expect("verification failed");
-        assert!(valid, "range_check proof should verify (200 fits in 8 bits)");
+        assert!(
+            valid,
+            "range_check proof should verify (200 fits in 8 bits)"
+        );
     }
 }

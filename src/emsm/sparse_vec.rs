@@ -28,7 +28,10 @@ impl<F: Field> SparseVector<F> {
     /// with a random nonzero field element.
     pub fn error_vec<R: Rng>(size: usize, t: usize, rng: &mut R) -> Self {
         if t == 0 || size == 0 {
-            return Self { size, entries: Vec::new() };
+            return Self {
+                size,
+                entries: Vec::new(),
+            };
         }
         assert!(size >= t, "need size >= t, got size={size}, t={t}");
         let chunk_size = size / t;

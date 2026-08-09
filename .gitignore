@@ -5,3 +5,6 @@ target
 progress.md
 task_plan.md
 findings.md
+.DS_Store
+mutants.out/
+mutants.out.old/

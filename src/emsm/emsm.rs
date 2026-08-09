@@ -46,7 +46,9 @@ impl<G: CurveGroup> EmsmPublicParams<G> {
     /// Preprocess: compute h = G^T * g (expand generators through transpose of RAA code).
     /// h has dimension N = 4n. Used by client to remove noise during decryption.
     pub fn preprocess(&self) -> PreprocessedCommitments<G> {
-        let h: Vec<G> = self.t_operator.multiply_transpose_group::<G>(&self.generators);
+        let h: Vec<G> = self
+            .t_operator
+            .multiply_transpose_group::<G>(&self.generators);
 
         // Convert to affine for Pedersen
         let h_affine: Vec<G::Affine> = h.iter().map(|p| p.into_affine()).collect();
