@@ -71,6 +71,9 @@ async fn every_data_plane_route_requires_a_credential() {
         (reqwest::Method::POST, "/v1/setup"),
         (reqwest::Method::POST, "/v1/prove"),
         (reqwest::Method::DELETE, "/v1/session"),
+        // Bulk release needs no session token, so it is the easiest route to
+        // leave unauthenticated by accident.
+        (reqwest::Method::DELETE, "/v1/sessions"),
     ];
 
     for (method, path) in routes {
@@ -295,6 +298,39 @@ async fn session_quota_is_enforced_per_principal() {
         resp.status().is_success(),
         "freeing a session must restore the allowance"
     );
+
+    // The restart case. Alice is at quota and has "lost" her tokens, as a crashed
+    // process would. Bulk release takes no session token — only the credential
+    // that survives a restart — so she can reclaim her own allowance.
+    assert_eq!(state.sessions.count_for("alice"), 2);
+    let resp = raw(
+        &http(),
+        reqwest::Method::DELETE,
+        format!("{url}/v1/sessions"),
+        Some(alice),
+        None, // deliberately no session token
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(resp.status().is_success());
+
+    let released: ReleaseAllResponse = bincode::deserialize(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(released.released, 2);
+    assert_eq!(state.sessions.count_for("alice"), 0);
+
+    // Scoped to the caller: Bob's session must survive.
+    assert_eq!(
+        state.sessions.count_for("bob"),
+        1,
+        "bulk release reached another client's sessions"
+    );
+
+    // Alice can set up again at once, rather than waiting out the idle timeout.
+    assert!(setup_as(&url, Some(alice), generators_body(4, 70))
+        .await
+        .status()
+        .is_success());
 }
 
 /// A tier's body limit is applied before the body is read.

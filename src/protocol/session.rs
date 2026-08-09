@@ -13,6 +13,16 @@
 //! **Sessions were never released.** The map had no TTL, no cap, and no teardown
 //! endpoint, so every `/setup` pinned its generators for the life of the process.
 //!
+//! A session now ends in one of four ways, and the client is responsible for none
+//! of them — an explicit release is only an optimisation:
+//!
+//! | Ending | Driven by | Purpose |
+//! |---|---|---|
+//! | Idle timeout | server sweeper | reclaim memory a client stopped using |
+//! | Maximum age | server sweeper | bound the lifetime of a bearer token |
+//! | `DELETE /v1/session` | client | return the client's own quota at once |
+//! | `DELETE /v1/sessions` | client | reclaim quota after losing the tokens |
+//!
 //! **Every `/prove` cloned the generators.** The old handler called
 //! `generators.clone()` five times and rebuilt all five `Pedersen` structs per
 //! request — tens of MiB of memcpy for a large circuit. The `Pedersen` instances
@@ -104,6 +114,11 @@ pub struct Session {
     pub owner: String,
     pub generators: Generators,
     pub resident_bytes: usize,
+    /// Milliseconds since the store's epoch when this session was created.
+    ///
+    /// Fixed for the life of the session, so it bounds the total lifetime of the
+    /// token. `last_seen_ms` alone cannot: every use resets it.
+    created_ms: u64,
     /// Milliseconds since the store's epoch at last successful lookup.
     last_seen_ms: AtomicU64,
 }
@@ -130,23 +145,52 @@ impl std::fmt::Debug for Session {
     }
 }
 
-/// Token-keyed session map with an idle TTL and a hard capacity cap.
+/// Why a session ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpiryReason {
+    /// Unused for longer than the idle timeout.
+    Idle,
+    /// Older than the absolute maximum age, however often it was used.
+    MaxAge,
+}
+
+/// What one sweep reclaimed, split by reason.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SweepOutcome {
+    pub idle: usize,
+    pub max_age: usize,
+}
+
+impl SweepOutcome {
+    pub fn total(&self) -> usize {
+        self.idle + self.max_age
+    }
+}
+
+/// Token-keyed session map with an idle TTL, an absolute age cap, and a hard
+/// capacity cap.
 pub struct SessionStore {
     inner: RwLock<HashMap<String, Arc<Session>>>,
     epoch: Instant,
     max_sessions: usize,
     ttl: Duration,
-    evicted: AtomicU64,
+    max_age: Duration,
+    /// Counted separately, because an operator debugging a session that vanished
+    /// needs to know which limit ended it.
+    evicted_idle: AtomicU64,
+    evicted_max_age: AtomicU64,
 }
 
 impl SessionStore {
-    pub fn new(max_sessions: usize, ttl: Duration) -> Self {
+    pub fn new(max_sessions: usize, ttl: Duration, max_age: Duration) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
             epoch: Instant::now(),
             max_sessions,
             ttl,
-            evicted: AtomicU64::new(0),
+            max_age,
+            evicted_idle: AtomicU64::new(0),
+            evicted_max_age: AtomicU64::new(0),
         }
     }
 
@@ -170,12 +214,14 @@ impl SessionStore {
         let token = mint_hex(TOKEN_BYTES);
         let label = mint_hex(LABEL_HEX_CHARS / 2);
 
+        let now = self.now_ms();
         let session = Arc::new(Session {
             label: label.clone(),
             owner: owner.to_string(),
             generators,
             resident_bytes,
-            last_seen_ms: AtomicU64::new(self.now_ms()),
+            created_ms: now,
+            last_seen_ms: AtomicU64::new(now),
         });
 
         let mut map = self.write();
@@ -254,20 +300,53 @@ impl SessionStore {
             .count()
     }
 
-    /// Evict every session past its idle TTL. Returns how many were dropped.
+    /// Evict every session past its idle TTL or its maximum age.
     ///
     /// Called on insert and by the background sweeper — the latter matters
     /// because an otherwise idle server should still release memory.
-    pub fn sweep(&self) -> usize {
+    pub fn sweep(&self) -> SweepOutcome {
         let now = self.now_ms();
+        let mut outcome = SweepOutcome::default();
+        let mut map = self.write();
+
+        map.retain(|_, s| match self.expiry_reason(s, now) {
+            None => true,
+            Some(ExpiryReason::Idle) => {
+                outcome.idle += 1;
+                false
+            }
+            Some(ExpiryReason::MaxAge) => {
+                outcome.max_age += 1;
+                false
+            }
+        });
+
+        if outcome.idle > 0 {
+            self.evicted_idle
+                .fetch_add(outcome.idle as u64, Ordering::Relaxed);
+        }
+        if outcome.max_age > 0 {
+            self.evicted_max_age
+                .fetch_add(outcome.max_age as u64, Ordering::Relaxed);
+        }
+        outcome
+    }
+
+    /// Drop every session owned by `principal_id`. Returns how many were dropped.
+    ///
+    /// A client keeps its session tokens in memory, so a crash loses them while
+    /// the sessions live on and keep counting against that principal's quota.
+    /// After enough restarts the client locks itself out until the idle timeout
+    /// expires. This lets it reclaim its own allowance using only its client
+    /// credential, which survives a restart.
+    ///
+    /// Scoped to one principal by construction: it cannot touch another client's
+    /// sessions even by accident.
+    pub fn remove_all_for(&self, principal_id: &str) -> usize {
         let mut map = self.write();
         let before = map.len();
-        map.retain(|_, s| !self.is_expired(s, now));
-        let dropped = before - map.len();
-        if dropped > 0 {
-            self.evicted.fetch_add(dropped as u64, Ordering::Relaxed);
-        }
-        dropped
+        map.retain(|_, s| s.owner != principal_id);
+        before - map.len()
     }
 
     pub fn len(&self) -> usize {
@@ -279,7 +358,15 @@ impl SessionStore {
     }
 
     pub fn evicted_total(&self) -> u64 {
-        self.evicted.load(Ordering::Relaxed)
+        self.evicted_idle.load(Ordering::Relaxed) + self.evicted_max_age.load(Ordering::Relaxed)
+    }
+
+    pub fn evicted_idle_total(&self) -> u64 {
+        self.evicted_idle.load(Ordering::Relaxed)
+    }
+
+    pub fn evicted_max_age_total(&self) -> u64 {
+        self.evicted_max_age.load(Ordering::Relaxed)
     }
 
     /// Total generator bytes currently pinned across all sessions.
@@ -288,8 +375,20 @@ impl SessionStore {
     }
 
     fn is_expired(&self, s: &Session, now_ms: u64) -> bool {
+        self.expiry_reason(s, now_ms).is_some()
+    }
+
+    /// Which limit ended this session, if any.
+    fn expiry_reason(&self, s: &Session, now_ms: u64) -> Option<ExpiryReason> {
         let last = s.last_seen_ms.load(Ordering::Relaxed);
-        Duration::from_millis(now_ms.saturating_sub(last)) > self.ttl
+        if Duration::from_millis(now_ms.saturating_sub(last)) > self.ttl {
+            return Some(ExpiryReason::Idle);
+        }
+        // Checked second, so an idle session is reported as idle rather than old.
+        if Duration::from_millis(now_ms.saturating_sub(s.created_ms)) > self.max_age {
+            return Some(ExpiryReason::MaxAge);
+        }
+        None
     }
 
     // A panic while holding this lock cannot leave the map structurally invalid —
@@ -325,8 +424,22 @@ mod tests {
         Generators::from_points(vec![], vec![], vec![], vec![], vec![])
     }
 
+    /// A store whose absolute age cap never binds, so a test can isolate the
+    /// idle timeout.
     fn store(max: usize, ttl_ms: u64) -> SessionStore {
-        SessionStore::new(max, Duration::from_millis(ttl_ms))
+        SessionStore::new(
+            max,
+            Duration::from_millis(ttl_ms),
+            Duration::from_secs(3600),
+        )
+    }
+
+    fn store_with_max_age(max: usize, ttl_ms: u64, max_age_ms: u64) -> SessionStore {
+        SessionStore::new(
+            max,
+            Duration::from_millis(ttl_ms),
+            Duration::from_millis(max_age_ms),
+        )
     }
 
     #[test]
@@ -385,13 +498,19 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
 
         assert!(s.get(&token).is_none(), "expired session must not resolve");
-        assert_eq!(s.sweep(), 1);
+        let swept = s.sweep();
+        assert_eq!(swept.total(), 1);
+        assert_eq!(swept.idle, 1, "an unused session expires by idleness");
+        assert_eq!(swept.max_age, 0);
         assert!(s.is_empty());
         assert_eq!(s.evicted_total(), 1);
+        assert_eq!(s.evicted_idle_total(), 1);
+        assert_eq!(s.evicted_max_age_total(), 0);
     }
 
     #[test]
-    fn active_use_refreshes_the_idle_timer() {
+    fn active_use_refreshes_the_idle_timer_but_not_the_absolute_age() {
+        // Part one: use resets the idle clock.
         let s = store(100, 200);
         let (token, _) = s.insert("owner", tiny_generators()).unwrap();
         for _ in 0..4 {
@@ -400,6 +519,23 @@ mod tests {
         }
         // Total elapsed (~240ms) exceeds the 200ms TTL, but each lookup touched it.
         assert_eq!(s.len(), 1);
+
+        // Part two: the same usage pattern must not defeat the absolute cap.
+        // Without it, a token used every 25 minutes would live for months.
+        let capped = store_with_max_age(100, 200, 150);
+        let (token, _) = capped.insert("owner", tiny_generators()).unwrap();
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(60));
+            capped.get(&token);
+        }
+        assert!(
+            capped.get(&token).is_none(),
+            "constant use kept a session past its maximum age"
+        );
+        let swept = capped.sweep();
+        assert_eq!(swept.max_age, 1, "must be reported as an age eviction");
+        assert_eq!(swept.idle, 0, "the session was in active use, not idle");
+        assert_eq!(capped.evicted_max_age_total(), 1);
     }
 
     #[test]
@@ -479,16 +615,30 @@ mod tests {
     }
 
     #[test]
-    fn sessions_are_counted_per_principal_for_quota() {
+    fn sessions_are_counted_and_released_per_principal() {
         let s = store(100, 60_000);
         s.insert("alice", tiny_generators()).unwrap();
         s.insert("alice", tiny_generators()).unwrap();
-        s.insert("bob", tiny_generators()).unwrap();
+        let (bob_token, _) = s.insert("bob", tiny_generators()).unwrap();
 
         assert_eq!(s.count_for("alice"), 2);
         assert_eq!(s.count_for("bob"), 1);
         assert_eq!(s.count_for("carol"), 0);
         assert_eq!(s.len(), 3);
+
+        // Bulk release is what a client uses after a restart, when it has lost its
+        // tokens but its sessions still count against its quota.
+        assert_eq!(s.remove_all_for("alice"), 2);
+        assert_eq!(s.count_for("alice"), 0);
+
+        // It must be scoped to one principal by construction.
+        assert_eq!(s.count_for("bob"), 1, "bulk release touched another client");
+        assert!(s.get(&bob_token).is_some());
+
+        // Releasing a principal with nothing is a no-op, not an error.
+        assert_eq!(s.remove_all_for("alice"), 0);
+        assert_eq!(s.remove_all_for("nobody"), 0);
+        assert_eq!(s.len(), 1);
     }
 
     #[test]

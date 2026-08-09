@@ -23,8 +23,13 @@ Rust implementation of "Single-Server Private Outsourcing of zk-SNARKs" (Abbasza
   - **Sessions are server-issued**: `/v1/setup` returns a 256-bit token. Clients
     never choose a session id. Neither credential is ever logged — log the
     non-secret `session_label` instead
-  - Sessions have an idle TTL, a per-process cap, a per-principal quota, and an
-    explicit release endpoint
+  - **The server always reclaims sessions itself**, by an idle TTL *and* an
+    absolute max age (the idle clock resets on use, so it alone cannot bound a
+    token's lifetime). The sweeper applies both with or without traffic. The two
+    `DELETE` endpoints are client-side optimisations, never the only path:
+    `/v1/session` returns quota at once, `/v1/sessions` reclaims all of a
+    principal's sessions after a restart has lost the tokens
+  - Sessions also have a per-process cap and a per-principal quota
   - Modules: `auth.rs` (principals, tiers, API keys, mTLS identity), `quota.rs`
     (token bucket, per-principal limits), `tls.rs` (rustls config, cert digests),
     `extract.rs` (auth middleware + extractors), `secret.rs` (random, hex, digest,

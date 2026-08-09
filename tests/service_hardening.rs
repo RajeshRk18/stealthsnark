@@ -196,11 +196,9 @@ async fn expired_sessions_are_refused_and_freed() {
         state.sessions.get(&parsed.session_token).is_none(),
         "an expired session must not resolve"
     );
-    assert_eq!(
-        state.sessions.sweep(),
-        1,
-        "expired session was not reclaimed"
-    );
+    let swept = state.sessions.sweep();
+    assert_eq!(swept.total(), 1, "expired session was not reclaimed");
+    assert_eq!(swept.idle, 1, "an abandoned session expires by idleness");
     assert_eq!(state.sessions.resident_bytes(), 0);
 }
 

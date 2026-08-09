@@ -84,7 +84,11 @@ impl AppState {
     }
 
     pub fn with_auth(config: ServerConfig, auth: AuthStore) -> Self {
-        let sessions = Arc::new(SessionStore::new(config.max_sessions, config.session_ttl));
+        let sessions = Arc::new(SessionStore::new(
+            config.max_sessions,
+            config.session_ttl,
+            config.session_max_age,
+        ));
         let msm_slots = Arc::new(Semaphore::new(config.max_concurrent_msm));
         Self {
             config: Arc::new(config),
@@ -137,6 +141,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/setup", post(handle_setup))
         .route("/v1/prove", post(handle_prove))
         .route("/v1/session", delete(handle_release))
+        .route("/v1/sessions", delete(handle_release_all))
         // Authentication, rate limit, and body-size quota run once for every
         // route below, so no route can be added without them.
         .layer(axum::middleware::from_fn_with_state(
@@ -444,17 +449,20 @@ async fn sweeper(state: AppState) {
             return;
         }
 
-        let dropped = state.sessions.sweep();
-        if dropped > 0 {
+        let swept = state.sessions.sweep();
+        if swept.total() > 0 {
             state
                 .metrics
                 .sessions_evicted
-                .fetch_add(dropped as u64, Ordering::Relaxed);
+                .fetch_add(swept.total() as u64, Ordering::Relaxed);
+            // Both reasons are logged, because an operator debugging a session
+            // that vanished needs to know which limit ended it.
             tracing::info!(
-                evicted = dropped,
+                evicted_idle = swept.idle,
+                evicted_max_age = swept.max_age,
                 remaining = state.sessions.len(),
                 resident_mib = state.sessions.resident_bytes() / (1024 * 1024),
-                "swept idle sessions"
+                "swept expired sessions"
             );
         }
 
@@ -647,6 +655,34 @@ async fn handle_release(
         "session released"
     );
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /v1/sessions` — release every session owned by the caller.
+///
+/// Takes no session token, only the client credential. That is the point: a
+/// client that crashed has lost its tokens, but its sessions still count against
+/// its quota until they time out. This lets it reclaim its own allowance with the
+/// credential that survived the restart.
+///
+/// Scoped to the caller by construction, so it cannot affect another client.
+async fn handle_release_all(
+    State(app): State<AppState>,
+    _version: ApiVersion,
+    Caller(principal): Caller,
+) -> Result<Bytes, ApiError> {
+    let released = app.sessions.remove_all_for(&principal.id);
+
+    tracing::info!(
+        principal = %principal.id,
+        released,
+        remaining = app.sessions.len(),
+        "released all sessions for principal"
+    );
+
+    let response = ReleaseAllResponse {
+        released: released.min(u32::MAX as usize) as u32,
+    };
+    Ok(Bytes::from(encode(&response)?))
 }
 
 // ---------------------------------------------------------------------------

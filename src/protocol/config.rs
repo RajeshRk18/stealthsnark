@@ -59,6 +59,17 @@ pub struct ServerConfig {
     /// Idle timeout after which a session is evicted and its generators freed.
     pub session_ttl: Duration,
 
+    /// Maximum total age of a session, however often it is used.
+    ///
+    /// [`Self::session_ttl`] is a cache policy: it reclaims memory a client has
+    /// stopped using. This is a credential policy. Without it a session token
+    /// stays valid for ever, because every use resets the idle clock — a client
+    /// proving once every 25 minutes would keep one bearer token alive for months.
+    ///
+    /// Must be at least `session_ttl`; a shorter value would make the idle
+    /// timeout unreachable.
+    pub session_max_age: Duration,
+
     /// How often the background sweeper looks for expired sessions. Sessions are
     /// also checked lazily on lookup; the sweeper exists so that an *idle*
     /// server still releases memory.
@@ -111,6 +122,9 @@ impl Default for ServerConfig {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_sessions: 64,
             session_ttl: Duration::from_secs(30 * 60),
+            // Long enough that a legitimate batch of proofs finishes inside one
+            // session, short enough that a token is not indefinite.
+            session_max_age: Duration::from_secs(12 * 60 * 60),
             sweep_interval: Duration::from_secs(60),
             max_concurrent_msm: default_concurrency(),
             admission_wait: Duration::from_secs(30),
@@ -151,6 +165,7 @@ impl ServerConfig {
             max_body_bytes: env_or("STEALTHSNARK_MAX_BODY_BYTES", d.max_body_bytes)?,
             max_sessions: env_or("STEALTHSNARK_MAX_SESSIONS", d.max_sessions)?,
             session_ttl: env_secs("STEALTHSNARK_SESSION_TTL_SECS", d.session_ttl)?,
+            session_max_age: env_secs("STEALTHSNARK_SESSION_MAX_AGE_SECS", d.session_max_age)?,
             sweep_interval: env_secs("STEALTHSNARK_SWEEP_INTERVAL_SECS", d.sweep_interval)?,
             max_concurrent_msm: env_or("STEALTHSNARK_MAX_CONCURRENT_MSM", d.max_concurrent_msm)?,
             admission_wait: env_secs("STEALTHSNARK_ADMISSION_WAIT_SECS", d.admission_wait)?,
@@ -179,6 +194,19 @@ impl ServerConfig {
         }
         if self.session_ttl.is_zero() {
             anyhow::bail!("STEALTHSNARK_SESSION_TTL_SECS must be >= 1");
+        }
+        if self.session_max_age.is_zero() {
+            anyhow::bail!("STEALTHSNARK_SESSION_MAX_AGE_SECS must be >= 1");
+        }
+        // A shorter absolute age would make the idle timeout unreachable, so the
+        // idle setting would silently do nothing.
+        if self.session_max_age < self.session_ttl {
+            anyhow::bail!(
+                "STEALTHSNARK_SESSION_MAX_AGE_SECS ({}s) must be >= \
+                 STEALTHSNARK_SESSION_TTL_SECS ({}s)",
+                self.session_max_age.as_secs(),
+                self.session_ttl.as_secs()
+            );
         }
         if self.quota_bucket_idle.is_zero() {
             anyhow::bail!("STEALTHSNARK_QUOTA_BUCKET_IDLE_SECS must be >= 1");
@@ -349,17 +377,26 @@ mod tests {
 
     #[test]
     fn zero_values_are_rejected() {
-        let mutations: [fn(&mut ServerConfig); 4] = [
+        let mutations: [fn(&mut ServerConfig); 6] = [
             |c| c.max_concurrent_msm = 0,
             |c| c.max_sessions = 0,
             |c| c.max_body_bytes = 0,
             |c| c.session_ttl = Duration::ZERO,
+            |c| c.session_max_age = Duration::ZERO,
+            // An absolute age below the idle timeout would make the idle setting
+            // unreachable, so it must not be accepted silently.
+            |c| c.session_max_age = c.session_ttl - Duration::from_secs(1),
         ];
         for mutate in mutations {
             let mut c = ServerConfig::default();
             mutate(&mut c);
             assert!(c.validate().is_err());
         }
+
+        // Equal values are fine: the idle timeout is then simply also the cap.
+        let mut equal = ServerConfig::default();
+        equal.session_max_age = equal.session_ttl;
+        assert!(equal.validate().is_ok());
     }
 
     #[test]

@@ -81,8 +81,9 @@ Defaults are chosen to fail safe rather than to be convenient:
   never a silent downgrade to plain HTTP.
 - API keys are stored as SHA-256 digests and compared in constant time. A wrong
   secret and an unknown key id return the same message.
-- Session generators are evicted after an idle TTL and capped in count, both
-  per process and per principal.
+- Session generators are evicted after an idle TTL *and* an absolute maximum age,
+  so a session token cannot stay valid indefinitely through constant use. Counts
+  are capped both per process and per principal.
 - Request bodies are capped; the cap times the MSM concurrency is the worst-case
   memory from in-flight bodies, and the server logs that product at startup.
 

@@ -79,7 +79,8 @@ Bodies are bincode over `application/octet-stream`. Errors come back as
 |---|---|---|---|
 | `POST` | `/v1/setup` | version, credential | Upload generators, receive a session token |
 | `POST` | `/v1/prove` | version, credential, session | Evaluate the five MSMs |
-| `DELETE` | `/v1/session` | version, credential, session | Release generators early |
+| `DELETE` | `/v1/session` | version, credential, session | Release one session early |
+| `DELETE` | `/v1/sessions` | version, credential | Release every session this client owns |
 
 | Header | Value |
 |---|---|
@@ -135,6 +136,33 @@ An API key looks like `ssk_<key id>_<secret>`. The key id makes lookup one map
 probe rather than a scan, and the secret is compared by constant-time digest
 equality. A wrong secret and an unknown key id return the *same* message, so an
 attacker cannot learn which key ids exist.
+
+### Who ends a session
+
+The client is not responsible for cleanup. The server always reclaims a session on
+its own, by two limits:
+
+| Limit | Setting | Purpose |
+|---|---|---|
+| Idle timeout | `SESSION_TTL_SECS` | A cache policy. Reclaims memory a client stopped using. Each use resets it. |
+| Maximum age | `SESSION_MAX_AGE_SECS` | A credential policy. Caps the total life of a token, which the idle timeout cannot: constant use would otherwise keep one token valid indefinitely. |
+
+The background sweeper applies both every `SWEEP_INTERVAL_SECS`, with or without
+traffic, and logs which limit ended each session.
+
+The two `DELETE` endpoints are therefore optimisations, not obligations:
+
+- `DELETE /v1/session` returns the client's quota at once, instead of leaving a
+  finished session counting against it for up to the idle timeout.
+- `DELETE /v1/sessions` is for after a restart. A client keeps its session tokens
+  in memory, so a crash loses them while the sessions live on and still count
+  against its quota. This endpoint takes **no session token** — only the client
+  credential, which survives a restart — and it is scoped to the caller, so it
+  cannot touch another client's sessions.
+
+The server cannot do better than a timeout on its own: it has no way to know which
+`/v1/prove` call is the last one, since the generators come from the proving key
+and one client may prove many statements with them.
 
 ### Per-principal quota
 
@@ -214,6 +242,7 @@ silently taking a default.
 | `STEALTHSNARK_MAX_BODY_BYTES` | `268435456` (256 MiB) | Largest request body. **This is what decides the largest servable circuit** — see below. |
 | `STEALTHSNARK_MAX_SESSIONS` | `64` | Cap on live sessions; each pins its generators in memory. |
 | `STEALTHSNARK_SESSION_TTL_SECS` | `1800` | Idle timeout before a session is evicted. |
+| `STEALTHSNARK_SESSION_MAX_AGE_SECS` | `43200` (12 h) | Absolute session lifetime, however often it is used. Must be >= the idle timeout. |
 | `STEALTHSNARK_SWEEP_INTERVAL_SECS` | `60` | How often idle sessions are reclaimed. |
 | `STEALTHSNARK_MAX_CONCURRENT_MSM` | `cores/2`, clamped to `[1,4]` | Concurrent MSM evaluations. Small on purpose: each MSM is already rayon-parallel internally. |
 | `STEALTHSNARK_ADMISSION_WAIT_SECS` | `30` | How long a request waits for a slot before a 503. |

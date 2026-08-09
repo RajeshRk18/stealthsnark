@@ -1,8 +1,5 @@
 //! Mint an API key and print the record for the auth file.
 //!
-//! Authentication is only usable if there is a supported way to create a
-//! credential. Without this, an operator would hand-compute a SHA-256 digest and
-//! very likely store the plaintext key by mistake.
 //!
 //! The secret is printed once and never written anywhere. The server only ever
 //! sees its digest, so a leaked auth file does not yield a usable key.

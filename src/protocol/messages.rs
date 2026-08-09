@@ -118,6 +118,17 @@ pub struct SetupResponse {
     pub session_label: String,
 }
 
+/// Response to `DELETE /v1/sessions`: how many sessions were released.
+///
+/// A new type rather than an empty 204, because the count is the only way a client
+/// that lost its tokens learns whether it had anything to reclaim. Adding an
+/// endpoint does not need a [`PROTOCOL_VERSION`] bump: an older client simply
+/// never calls it, and no existing type changed shape.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReleaseAllResponse {
+    pub released: u32,
+}
+
 /// Setup request: generator points for each of the 5 MSMs.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SetupRequest {

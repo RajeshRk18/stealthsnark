@@ -18,8 +18,8 @@ use std::time::Duration;
 use anyhow::Result;
 
 use super::messages::{
-    ProveRequest, ProveResponse, SetupRequest, SetupResponse, PROTOCOL_VERSION, SESSION_HEADER,
-    VERSION_HEADER,
+    ProveRequest, ProveResponse, ReleaseAllResponse, SetupRequest, SetupResponse, PROTOCOL_VERSION,
+    SESSION_HEADER, VERSION_HEADER,
 };
 
 /// Default per-request ceiling.
@@ -57,7 +57,6 @@ pub struct EmsmClientBuilder {
     credential: Credential,
     root_certificate_pem: Option<Vec<u8>>,
     client_identity_pem: Option<Vec<u8>>,
-    accept_invalid_certs: bool,
 }
 
 impl EmsmClientBuilder {
@@ -68,7 +67,6 @@ impl EmsmClientBuilder {
             credential: Credential::None,
             root_certificate_pem: None,
             client_identity_pem: None,
-            accept_invalid_certs: false,
         }
     }
 
@@ -114,16 +112,6 @@ impl EmsmClientBuilder {
         Ok(self.client_identity_pem(pem))
     }
 
-    /// Skip server certificate verification.
-    ///
-    /// Only for a local test against a self-signed certificate. It removes the
-    /// guarantee that you are talking to the intended server, so prefer
-    /// [`Self::root_certificate_pem`] in every other case.
-    pub fn danger_accept_invalid_certs(mut self, accept: bool) -> Self {
-        self.accept_invalid_certs = accept;
-        self
-    }
-
     pub fn build(self) -> Result<EmsmClient> {
         let mut builder = reqwest::Client::builder()
             .timeout(self.request_timeout)
@@ -145,9 +133,6 @@ impl EmsmClientBuilder {
         }
         if let Some(pem) = &self.client_identity_pem {
             builder = builder.identity(reqwest::Identity::from_pem(pem)?);
-        }
-        if self.accept_invalid_certs {
-            builder = builder.danger_accept_invalid_certs(true);
         }
 
         Ok(EmsmClient {
@@ -247,15 +232,42 @@ impl EmsmClient {
     }
 
     /// `DELETE /v1/session` — free the server's copy of the generators now,
-    /// instead of leaving them pinned until the idle TTL expires.
-    pub async fn release(&self) -> Result<()> {
+    /// instead of leaving them pinned until the idle timeout expires.
+    ///
+    /// Clears the local token on success. The token is dead server-side, so
+    /// keeping it would turn the next call into a puzzling 401 instead of a clear
+    /// local error.
+    pub async fn release(&mut self) -> Result<()> {
         let resp = self
             .request(reqwest::Method::DELETE, "/v1/session")
             .header(SESSION_HEADER, self.token()?)
             .send()
             .await?;
         read_success(resp, "release").await?;
+        self.forget_session();
         Ok(())
+    }
+
+    /// `DELETE /v1/sessions` — release every session this client owns on the
+    /// server. Returns how many were released.
+    ///
+    /// Needs no session token, only the client credential. Use it after a restart:
+    /// the sessions from the previous run still count against this client's quota,
+    /// and their tokens died with the old process.
+    pub async fn release_all(&mut self) -> Result<u32> {
+        let resp = self
+            .request(reqwest::Method::DELETE, "/v1/sessions")
+            .send()
+            .await?;
+        let bytes = read_success(resp, "release_all").await?;
+        let parsed: ReleaseAllResponse = bincode::deserialize(&bytes)?;
+        self.forget_session();
+        Ok(parsed.released)
+    }
+
+    fn forget_session(&mut self) {
+        self.session_token = None;
+        self.session_label = None;
     }
 
     /// Start a request with the version header and the client credential applied.
@@ -269,7 +281,7 @@ impl EmsmClient {
 
         match &self.credential {
             Credential::ApiKey(key) => builder.bearer_auth(key),
-            // The certificate travels in the TLS handshake; nothing to add.
+            // The certificate travels in the TLS handshake.
             Credential::ClientCertificate | Credential::None => builder,
         }
     }
@@ -399,12 +411,16 @@ mod tests {
     }
 
     #[test]
-    fn builder_selects_the_credential_kind() {
+    fn builder_selects_the_credential_kind_and_tls_options() {
         let keyed = EmsmClient::builder("http://x").api_key("ssk_a_b");
         assert!(matches!(keyed.credential, Credential::ApiKey(_)));
 
         let plain = EmsmClient::builder("http://x");
         assert!(matches!(plain.credential, Credential::None));
+
+        // Supplying an identity implies the certificate is the credential.
+        let certed = EmsmClient::builder("http://x").client_identity_pem(b"pem".to_vec());
+        assert!(matches!(certed.credential, Credential::ClientCertificate));
     }
 
     #[test]
