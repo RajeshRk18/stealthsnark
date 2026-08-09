@@ -1,18 +1,18 @@
-# StealthSnark — Verification Strategy
+# StealthSnark Verification Strategy
 
-This document describes how the implementation is verified, organised by the
-**security property** each layer protects — not by the tool used. The guiding
-principle is that every check should rest on an *oracle independent of the code
-under test*, because the dangerous failures here are silent: a proof can verify
-while the system is unsound or leaking the witness.
+Verification is organised by the security property each layer protects, not by
+the tool used. Every check rests on an oracle independent of the code under
+test, because the dangerous failures here are silent: a proof can verify while
+the system is unsound or leaking the witness.
 
-## Threat model & properties
+## Threat model and properties
 
-The server is the adversary. Two modes are supported and tested:
+The server is the adversary. Both modes are tested.
 
-- **Semi-honest** — the server follows the protocol but tries to learn the witness.
-- **Malicious** — the server may also return wrong MSM results (double-query
-  consistency check defends against this).
+| Mode | Server behaviour |
+|---|---|
+| Semi-honest | Follows the protocol, but tries to learn the witness |
+| Malicious | Also returns wrong MSM results; the double-query consistency check catches this |
 
 | Property | What a silent failure looks like | How it's verified | Independent oracle |
 |----------|----------------------------------|-------------------|--------------------|
@@ -35,7 +35,7 @@ The server is the adversary. Two modes are supported and tested:
 | **RAA kernel correctness (all inputs ≤ bound)** | a suffix-sum / fold / permute kernel is wrong on an untested input | `cargo kani` proofs in `raa_code.rs` | bounded model checking (CBMC) |
 | **Test-suite adequacy** | tests pass even when code is broken | `cargo mutants` | mutation testing |
 
-## Test layers & how to run them
+## Test layers and how to run them
 
 ### 1. Unit + integration tests (`cargo test`)
 
@@ -45,29 +45,29 @@ cargo test                 # all unit tests + every integration suite below
 
 Integration suites (in `tests/`):
 
-- **`differential.rs`** — the server-aided proof (semi-honest *and* malicious)
+- **`differential.rs`**: the server-aided proof (semi-honest *and* malicious)
   must verify exactly like a stock `ark-groth16` proof for the same circuit and
-  witness, across many witnesses; and must **fail** for a wrong public input.
-  `ark-groth16` is the independent reference we are outsourcing, so this is the
+  witness, across many witnesses, and must **fail** for a wrong public input.
+  `ark-groth16` is the independent reference being outsourced, so this is the
   strongest cheap correctness oracle.
-- **`privacy.rs`** — the witness-hiding property the whole system exists for:
+- **`privacy.rs`**: witness hiding, the property the whole system exists for:
   - noise/mask is freshly sampled per MSM, per main/check query, and per call
     (structural regression guards against noise reuse);
-  - every witness coordinate is actually masked and the mask is non-constant;
+  - every witness coordinate is masked, and the mask is non-constant;
   - the masked output distribution is independent of the witness
-    (self-calibrated: cross-witness TVD vs same-witness baseline — robust, not
-    a crypto-grade proof);
+    (self-calibrated: cross-witness TVD against a same-witness baseline, which is
+    robust but not a crypto-grade proof);
   - proof blinders randomise each proof.
-- **`malicious_soundness.rs`** — tampering with *each* of the ten MSM results
-  (individually, then random combinations via proptest) must be rejected
-  outright. Random offsets pass the consistency check only with probability
-  ~2^-254, so the hard assert cannot flake — and anything weaker would silently
-  tolerate detection regressions (a `_ck`-only tamper never enters proof
-  assembly, so a broken check would still hand back a verifying proof).
-- **`session_stress.rs`** — many concurrent clients across two distinct keys;
+- **`malicious_soundness.rs`**: tampering with *each* of the ten MSM results
+  (individually, then random combinations via a 200-case proptest) must be
+  rejected outright. Random offsets pass the consistency check only with
+  probability ~2^-254, so the hard assert cannot flake. A weaker assert would
+  tolerate detection regressions: a `_ck`-only tamper never enters proof
+  assembly, so a broken check would still hand back a verifying proof.
+- **`session_stress.rs`**: many concurrent clients across two distinct keys;
   cross-session generator clobbering would surface as a verify failure. Also
   asserts that forged bearer tokens are refused with 401 under concurrency.
-- **`service_hardening.rs`** — the service-layer properties that no
+- **`service_hardening.rs`**: the service-layer properties that no
   cryptographic test can observe, because every crypto suite uses a toy circuit:
 
   | Test | Property |
@@ -85,13 +85,13 @@ Integration suites (in `tests/`):
   | `health_endpoints_are_unauthenticated_and_unversioned` | probes need no protocol knowledge |
   | `metrics_reflect_traffic` | counters move, incl. the cheating-server counter |
 
-  The first of these is the one worth dwelling on. Five verification layers —
-  differential, privacy, proptest soundness, fuzzing, Kani — all passed while
-  axum's default 2 MiB body limit made the service unable to accept any circuit
-  large enough to be worth outsourcing. Correctness oracles cannot see a
-  capacity ceiling; only a realistically-sized payload can.
+  The first row is why this suite exists. Five layers (differential, privacy,
+  proptest soundness, fuzzing, Kani) all passed while axum's default 2 MiB body
+  limit made the service unable to accept any circuit large enough to be worth
+  outsourcing. A correctness oracle cannot see a capacity ceiling. Only a
+  realistically sized payload can.
 
-- **`auth_quota.rs`** — client authentication and per-principal quota over HTTP.
+- **`auth_quota.rs`**: client authentication and per-principal quota over HTTP.
   The unit tests in `protocol::auth` and `protocol::quota` check the rules in
   isolation; these check the rules are *wired in*. A route mounted outside the
   authenticate layer, or a handler that forgot to charge quota, passes every unit
@@ -108,27 +108,27 @@ Integration suites (in `tests/`):
   | `unauthenticated_traffic_does_not_spend_a_principals_allowance` | check order: authenticate before charging quota |
   | `the_client_completes_a_session_with_an_api_key` | the real client flow verifies a proof end to end |
 
-- **`tls_mtls.rs`** — real handshakes, because the mTLS identity path cannot be
-  checked any other way: whether rustls verified the chain, and whether the
-  resulting certificate digest reaches the middleware, only becomes true after a
-  handshake completes. A throwaway CA, server certificate, and two client
-  certificates are generated in memory by `rcgen`, so no private key is committed.
-  Gated on `#![cfg(feature = "tls")]`.
+- **`tls_mtls.rs`**: real handshakes, because the mTLS identity path cannot be
+  checked any other way. Whether rustls verified the chain, and whether the
+  resulting certificate digest reaches the middleware, only become true once a
+  handshake completes. `rcgen` generates a throwaway CA, a server certificate,
+  and two client certificates in memory, so no private key is committed. Gated
+  on `#![cfg(feature = "tls")]`.
 
   | Test | Property |
   |---|---|
   | `tls_serves_a_client_that_trusts_the_ca` | TLS works end to end |
-  | `tls_rejects_a_client_that_does_not_trust_the_ca` | verification is real — if this passes, it is not happening |
+  | `tls_rejects_a_client_that_does_not_trust_the_ca` | verification is real; if this test passes, it is not happening |
   | `mtls_authenticates_a_registered_certificate` | identity from the handshake, no header |
   | `mtls_refuses_an_unregistered_certificate` | a valid chain is necessary but not sufficient |
   | `mtls_requires_a_certificate` | mTLS-only refuses at the handshake |
   | `any_mode_accepts_a_certificate_or_a_key` | optional client auth, so a key client still connects |
   | `mtls_identity_is_bound_to_its_sessions` | ownership holds regardless of how identity was proved |
 
-  Worth recording: the first run of this suite failed with `KeyMismatch` and
-  `BadSignature` because every test shared one PKI directory and parallel runs
-  overwrote each other's keys. The symptom looked like a cryptographic fault and
-  was a test-isolation bug.
+  The first run of this suite failed with `KeyMismatch` and `BadSignature`
+  because every test shared one PKI directory and parallel runs overwrote each
+  other's keys. The symptom read as a cryptographic fault; the cause was test
+  isolation.
 
 ### 2. Benchmarks (`cargo bench`)
 
@@ -142,6 +142,8 @@ for superlinear regressions in the RAA path) and end-to-end proving cost.
 ### 3. Fuzzing (`cargo +nightly fuzz`)
 
 Requires nightly + `cargo install cargo-fuzz` (already vendored under `fuzz/`).
+Fuzzing needs the lean core without wasmer; the `fuzz/` crate already sets
+`default-features = false`.
 
 ```sh
 cargo +nightly fuzz run vec_deser          # deserialization never panics/OOMs
@@ -152,7 +154,7 @@ cargo +nightly fuzz run malicious_response # soundness: tamper => caught, never 
 `malicious_response` is the soundness fuzzer: it builds the setup once, then on
 each input copies the honest response, applies fuzz-driven tampering to the ten
 components, and asserts every tamper is rejected (an untampered response must
-still decrypt to a sound proof) — hunting directly for check-bypassing inputs.
+still decrypt to a sound proof).
 
 ### 4. Mutation testing (`cargo mutants`)
 
@@ -161,9 +163,10 @@ cargo install cargo-mutants
 cargo mutants              # scoped to soundness/privacy-critical modules via .cargo/mutants.toml
 ```
 
-Proves the tests above actually fail when the implementation is broken. A
-**surviving** mutant in `malicious.rs`, `emsm.rs`, or `server_aided.rs` is a real
-gap to close.
+Checks that the tests above actually fail when the implementation is broken. The
+scope in `.cargo/mutants.toml` covers 296 mutation points across the
+soundness-critical and privacy-critical modules. A **surviving** mutant in
+`malicious.rs`, `emsm.rs`, or `server_aided.rs` is a real gap to close.
 
 ### 5. Formal verification (`cargo kani`)
 
@@ -172,14 +175,13 @@ cargo install --locked kani-verifier && cargo kani setup   # one-time
 cargo kani --no-default-features --lib                      # run all proofs
 ```
 
-Where do bounded proofs actually pay here? Not on the protocol math (proved on
-paper by the authors), not on field/curve arithmetic (trusted to `arkworks`, and
-intractable for a bit-blasting checker), and not on the witness-hiding property
-(probabilistic, not an assertion). They pay on the **RAA scalar kernels** — the
-suffix-sum chunking and 4:1 fold — which are pure, bounded, and exactly where
-mutation testing already showed the logic is subtle enough to hide dead code.
-Sampled-size tests check *specific* large inputs; these proofs check *all* inputs
-up to a small bound.
+Bounded proofs do not pay on the protocol math (proved on paper by the authors),
+on field and curve arithmetic (trusted to `arkworks`, and intractable for a
+bit-blasting checker), or on witness hiding (probabilistic, not an assertion).
+They pay on the **RAA scalar kernels**: the suffix-sum chunking and 4:1 fold,
+which are pure, bounded, and exactly where mutation testing already showed the
+logic is subtle enough to hide dead code. Sampled-size tests check *specific*
+large inputs; these proofs check *all* inputs up to a small bound.
 
 The kernels are generic over a minimal `Additive` trait (identity, `+=`,
 is-zero). Production runs them on BN254's scalar field via a blanket
@@ -187,9 +189,9 @@ is-zero). Production runs them on BN254's scalar field via a blanket
 model type `Toy` = wrapping `u64` (the monoid ℤ/2⁶⁴) that CBMC can reason about
 symbolically. Because the kernels rely only on the commutative-monoid laws,
 every identity proved for `Toy` transfers to any field. The parallel (rayon)
-branches reduce to these same kernels; rayon only changes the execution order of
-independent per-chunk work, which is irrelevant to the (order-independent)
-result, so the sequential models faithfully cover them.
+branches reduce to these same kernels: rayon changes only the execution order of
+independent per-chunk work, which the order-independent result ignores, so the
+sequential models faithfully cover them.
 
 Harnesses (in `raa_code.rs`, `#[cfg(kani)] mod kani_proofs`):
 
@@ -202,61 +204,55 @@ Harnesses (in `raa_code.rs`, `#[cfg(kani)] mod kani_proofs`):
 | `permute_safe_in_bounds_is_correct` | with in-range indices, `permute_safe` never panics and yields `out[i] = v[perm[i]]` |
 | `inverse_permutation_inverts_valid_permutation` | for any valid permutation, `inverse_permutation` returns its true inverse and never panics |
 
-`--no-default-features --lib` is required so the wasmer-backed `circom` feature
-(and the feature-gated `client` binary) are excluded — CBMC cannot codegen
-wasmer, and the kernels don't need it.
+`--no-default-features --lib` excludes the wasmer-backed `circom` feature and
+the feature-gated `client` binary, because CBMC cannot codegen wasmer and the
+kernels do not need it.
 
-**Why not Kani on `messages.rs`?** `ark_vec_from_bytes` has a data-dependent
+**No Kani harness on `messages.rs`.** `ark_vec_from_bytes` has a data-dependent
 loop bound (`0..len`, `len` up to 2²⁴), so the meaningful "no panic over all
 inputs" property is out of reach for a bounded checker, and the real DoS property
-is a *heap-allocation* bound CBMC doesn't model. That deserialization loop is
-better served by the `vec_deser` fuzzer (its actual oracle), which is why no Kani
-harness is added there.
+is a *heap-allocation* bound CBMC doesn't model. The `vec_deser` fuzzer is that
+loop's oracle instead.
 
 ## Findings
 
 - **Memory-amplification DoS in `ark_vec_from_bytes`** (found by the `vec_deser`
   fuzzer on its first run). The function read a length prefix up to
   `MAX_VEC_LEN` (2²⁴) and called `Vec::with_capacity(len)` before checking the
-  body actually contained that many elements — a tiny request with a maxed-out
-  length prefix forced a ~0.5–1.5 GB allocation. Note that capping by the
-  remaining *byte* count is not enough: the allocation is
-  `count * size_of::<T>()` (~136 bytes per input byte for G2Affine), so a
-  few-MB junk body would still buy hundreds of MB upfront. Fixed by capping the
-  initial capacity at a small constant (`MAX_PREALLOC_ELEMS`) and letting the
-  Vec grow amortized as elements actually decode. Regression:
+  body actually contained that many elements, so a tiny request with a maxed-out
+  length prefix forced a 0.5 to 1.5 GB allocation. Capping by the remaining
+  *byte* count is not enough: the allocation is `count * size_of::<T>()` (~136
+  bytes per input byte for G2Affine), so a few-MB junk body would still buy
+  hundreds of MB upfront. Fixed by capping the initial capacity at a small
+  constant (`MAX_PREALLOC_ELEMS`) and letting the Vec grow amortized as elements
+  actually decode. Regression:
   `messages::tests::test_huge_length_prefix_tiny_body_does_not_overallocate`.
 
 - **Untested parallel paths in the RAA code** (found by `cargo mutants`). 16
   mutants survived in the parallel branch of `apply_f_fold`, and the parallel
-  branches of `accumulate_inplace` and `permute_safe` were likewise uncovered —
-  every existing test ran below `PARALLEL_THRESHOLD` (65536 elements), so the
-  rayon paths in the hot loop never executed. A bug there would ship silently and
-  only bite on large circuits. Closed with three large-size tests that check each
+  branches of `accumulate_inplace` and `permute_safe` were uncovered too. Every
+  existing test ran below `PARALLEL_THRESHOLD` (65536 elements), so the rayon
+  paths in the hot loop never executed; a bug there would ship silently and only
+  bite on large circuits. Closed with three large-size tests that check each
   parallel path against an independent sequential reference
   (`raa_code::tests::{test_fold_parallel_path,
   test_accumulate_parallel_matches_sequential_reference,
   test_permute_parallel_matches_reference}`). Re-running confirms it: of 98
   mutants on the RAA module, 81 are now caught and the 14 survivors are all
-  *equivalent* mutants — they flip which already-verified branch runs (the
-  `PARALLEL_THRESHOLD` comparisons) or change the parallel chunk count, neither
+  *equivalent* mutants, flipping which already-verified branch runs (the
+  `PARALLEL_THRESHOLD` comparisons) or changing the parallel chunk count, neither
   of which alters the result. Investigating two survivors also surfaced **dead
   code** in `accumulate_inplace`'s parallel correction step (a first loop fully
   overwritten by the next), now removed. The accumulator's suffix-sum semantics
   were cross-checked against the paper (§2.3: A is the upper-triangular all-ones
   matrix, i.e. a suffix sum).
 
-## Out of scope / future work
+## Out of scope and future work
 
-- **Field & curve arithmetic** is trusted to `arkworks` (not re-verified here),
-  and is out of reach for a bit-blasting model checker anyway. The pure RAA
-  kernels that *are* tractable are now covered by `cargo kani` (see §5). The
-  protocol-level soundness/privacy theorems are proved on paper by the authors;
-  re-proving them in a proof assistant (Lean/Coq) over abstract groups is a
-  research effort, not a hardening step, and is deliberately not attempted.
-- **Constant-timeness** of masking is not asserted (the server only sees masked
-  data; timing channels are out of the current model).
-- **Replay / freshness** protection at the protocol layer is intentionally left
-  to the application embedding this library.
-- **LPN parameter security** (`params.rs`, Table 3) is a trust assumption carried
-  from the paper; the code enforces structural validity, not the security bound.
+| Not verified here | Why |
+|---|---|
+| Field and curve arithmetic | Trusted to `arkworks`, and out of reach for a bit-blasting model checker anyway. The pure RAA kernels that *are* tractable are covered by `cargo kani` (see §5). |
+| Protocol-level soundness and privacy theorems | Proved on paper by the authors. Re-proving them in a proof assistant (Lean/Coq) over abstract groups is a research effort, not a hardening step, and is deliberately not attempted. |
+| Constant-timeness of masking | Not asserted. The server only sees masked data, and timing channels are out of the current model. |
+| Replay / freshness protection at the protocol layer | Intentionally left to the application embedding this library. |
+| LPN parameter security (`params.rs`, Table 3) | A trust assumption carried from the paper. The code enforces structural validity, not the security bound. |

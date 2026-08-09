@@ -18,11 +18,12 @@
 //! `x-stealthsnark-version`. `/v1/prove` and `/v1/session` also carry
 //! `x-stealthsnark-session`.
 //!
-//! | Method | Path | Purpose |
-//! |---|---|---|
-//! | POST | `/v1/setup` | Upload generators, receive a session token |
-//! | POST | `/v1/prove` | Evaluate the five MSMs |
-//! | DELETE | `/v1/session` | Release generators early |
+//! | Method | Path | Session header | Purpose |
+//! |---|---|---|---|
+//! | POST | `/v1/setup` | no | Upload generators, receive a session token |
+//! | POST | `/v1/prove` | yes | Evaluate the five MSMs |
+//! | DELETE | `/v1/session` | yes | Release one session early |
+//! | DELETE | `/v1/sessions` | no | Release every session this caller owns |
 //!
 //! # Two structural properties
 //!
@@ -78,7 +79,9 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// State with authentication disabled. For tests and loopback development.
+    /// State with authentication disabled.
+    /// **NOTE:** It must be used only for tests and loopback development.
+    /// Must use `with_auth` for production deployment
     pub fn new(config: ServerConfig) -> Self {
         Self::with_auth(config, AuthStore::disabled())
     }
@@ -169,9 +172,19 @@ pub fn create_admin_router(state: AppState) -> Router {
 
 /// Apply the middleware shared by both planes.
 ///
-/// Outermost first: a panicking handler becomes one 500 rather than a dead
-/// process, and a wedged request cannot hold a connection for ever. The request
-/// id is set before `TraceLayer` so that every log line for a request correlates.
+/// **Each `.layer()` wraps the previous one, so the last call is the outermost**
+/// and a request traverses them bottom-up:
+///
+/// ```text
+/// request  -> SetRequestId -> Trace -> PropagateRequestId -> Timeout -> CatchPanic -> handler
+/// ```
+///
+/// That ordering is deliberate in two places. `SetRequestId` must be outermost so
+/// that `Trace` below it can attach the id to every log line for the request, and
+/// so `PropagateRequestId` finds an id to copy onto the response (verified: every
+/// response carries `x-request-id`). `CatchPanic` sits innermost, placed directly
+/// around the handler where a panic can realistically happen, so a bad request
+/// becomes a single 500 rather than a dead process.
 fn with_common_layers<S>(router: Router<S>, cfg: &ServerConfig) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -220,7 +233,7 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
     );
 
     if !cfg.auth_mode.is_enabled() {
-        // Loud, because `validate` only permits this on loopback and an operator
+        // Loud because `validate` only permits this on loopback and an operator
         // who did not intend it should see it immediately.
         tracing::warn!("authentication is DISABLED; every caller is the `anonymous` principal");
     }
@@ -291,10 +304,9 @@ async fn serve_data_plane(state: AppState) -> anyhow::Result<()> {
 
 /// TLS accept loop.
 ///
-/// Hand-rolled because `axum::serve` cannot expose the peer certificate, and mTLS
-/// identity is useless if the handler cannot see who connected. Each accepted
+/// Hand-rolled because `axum::serve` cannot expose the peer certificate. Each accepted
 /// connection completes its handshake, the peer certificate digest goes into the
-/// request extensions, and hyper serves the connection from there.
+/// request extensions, and hyper will start serving the connection.
 #[cfg(feature = "tls")]
 async fn serve_tls(
     listener: tokio::net::TcpListener,
