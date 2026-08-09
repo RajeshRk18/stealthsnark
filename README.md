@@ -19,7 +19,7 @@ answers its own health checks.
 
 [ARCHITECTURE.md](ARCHITECTURE.md) covers how it is built and the invariants a
 change must not break. [VERIFICATION.md](VERIFICATION.md) covers how each property
-is tested. [SECURITY.md](SECURITY.md) covers the scope and the non-goals.
+is tested. The limitations are listed at the end of this file.
 
 ## Architecture
 
@@ -303,7 +303,7 @@ TLS path is a startup error, not a downgrade to plain HTTP.
 | `STEALTHSNARK_CA_CERT` | none | Client binary only: trust a private CA. |
 | `STEALTHSNARK_CLIENT_IDENTITY` | none | Client binary only: certificate and key in one PEM for mTLS. |
 
-Startup refuses these combinations:
+Server startup refuses these mis-configs:
 
 - authentication disabled on a non-loopback bind address.
 - authentication enabled with no auth file.
@@ -311,12 +311,6 @@ Startup refuses these combinations:
 - an admin bind that is not loopback, or equal to the data bind.
 - a TLS certificate without its key.
 - TLS configured in a binary built without the `tls` feature.
-
-**Sizing the body limit:** `/v1/setup` uploads every generator for all five MSMs
-in one body. A compressed G1 point is 32 bytes and a G2 point 64, so 2^20
-generators per MSM is about 192 MiB. Bodies are buffered before decoding, so
-worst-case memory is `MAX_BODY_BYTES * MAX_CONCURRENT_MSM`, which the server logs
-at startup.
 
 ## Security and verification
 
@@ -328,12 +322,20 @@ which a double-query consistency check detects with probability about
 The risk is silent failure: a proof can verify while the system is unsound or leaking the witness.  Every check therefore rests on an oracle independent of the code under test, across differential
 testing, statistical privacy tests, proptest soundness, three fuzz targets, mutation testing, and bounded model checking with Kani. It has caught two real bugs so far.
 
-[VERIFICATION.md](VERIFICATION.md) has details on the strategies, and the findings.
+[VERIFICATION.md](VERIFICATION.md) has details on the strategies and the findings.
+
+## Limitations and future TODOs
+- Certificate identity is pinned by digest. mTLS identifies a client by the SHA-256 of its certificate, so a renewed certificate is a new identity and must be re-registered.
+- API keys live forever. Removing a record from the auth file revokes a key but it needs a restart. There is no online revocation and no expiry.
+- Currently, user's quota is per process. Rate-limit and session counts live in memory, so it is fine for a single-server instance we have now. This can be a todo to demonstrate shared state in a distributed architecture if we implement multiple servers or clusters support.
+- Semi-honest mode trusts the server's arithmetic Only the malicious-secure path (`malicious_*`) detects a cheating server. 
+- Session token lookup is not constant-time.
+- Resource exhaustion is within the configured limits. Currently, server admits only `STEALTHSNARK_MAX_CONCURRENT_MSM` MSMs of up to `STEALTHSNARK_MAX_BODY_BYTES` each as we dont want the server to Dos attacked.
 
 ## References
 
 - Abbaszadeh, Hafezi, Katz, Meiklejohn. *Single-Server Private Outsourcing of zk-SNARKs*. 2024.
-- [Reference implementation](https://github.com/h-hafezi/server-aided-snarks) (arkworks 0.4, library-only)
+- [Reference implementation](https://github.com/h-hafezi/server-aided-snarks)
 
 ## License
 
