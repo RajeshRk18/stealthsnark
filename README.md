@@ -6,7 +6,7 @@ Rust implementation of **"Single-Server Private Outsourcing of zk-SNARKs"**
 A client outsources the heavy multi-scalar multiplication (MSM) work of Groth16
 proving to an untrusted server without revealing the witness. The witness is
 masked with LPN-based noise (the EMSM primitive), the server computes MSMs on
-masked data, and the client recovers a valid proof locally.
+masked data, and the client demasks and recovers a valid proof locally.
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) covers how it is built and the invariants a change must not break. 
 - [VERIFICATION.md](VERIFICATION.md) covers how each property is tested. The limitations are listed at the end of this file.
@@ -94,9 +94,7 @@ CLIENT                                             SERVER
 ./circuits/compile.sh
 ```
 
-Compiles the two sample circuits in `circuits/` (`multiplier2`, `a * b = c`, and
-`range_check`, an 8-bit range proof) into `circuits/build/` as R1CS and WASM. The
-demo and the Circom tests use them; build artifacts are gitignored.
+Compiles the two sample circuits in `circuits/`.
 
 ### 2. Run tests
 
@@ -104,7 +102,7 @@ demo and the Circom tests use them; build artifacts are gitignored.
 cargo test
 ```
 
-Runs the full suite: EMSM primitives, Groth16 server-aided proving (native CubeCircuit + Circom circuits), protocol serialization.
+Runs the full suite: EMSM primitives, Groth16 server-aided proving, protocol serialization.
 
 ### 3. Run client/server demo
 
@@ -119,8 +117,6 @@ Terminal 2, run the client:
 ```sh
 cargo run --bin client
 ```
-
-The client performs Groth16 setup, sends generators to the server, masks the witness, delegates MSM computation, recovers the proof, verifies it locally, then releases the session.
 
 ## Using your own circuit
 
@@ -144,6 +140,37 @@ let circuit = build_circuit(
 )?;
 let public_inputs = get_public_inputs(&circuit).unwrap();
 ```
+
+## Performance
+
+My machine spec: Macbook M4 Air, 24GB RAM, 10 cores.
+
+Benchmark setup: 8 concurrent clients. Clients and the server run in the same process (see benches/throughput.rs)
+
+- server per request - server's time around one request's work excluding queue wait.
+- req/s - number of requests processed across workers per second.
+
+**1. Default admission bound (4):**
+
+| generators | req/s | p50 | p95 | server per request |
+|---|---|---|---|---|
+| 4096 | 31.4 | 244 ms | 295 ms | 124 ms |
+| 16384 | 9.3 | 838 ms | 984 ms | 417 ms |
+| 65536 | 2.3 | 3221 ms | 4226 ms | 1664 ms |
+
+---
+---
+
+**2. Various bounds at 16384 generators:**
+
+| `STEALTHSNARK_MAX_CONCURRENT_MSM` | req/s | p95 | server per request |
+|---|---|---|---|
+| 1 | 8.2 | 1025 ms | 122 ms |
+| 2 | 8.1 | 1061 ms | 244 ms |
+| 4 | 7.8 | 1158 ms | 498 ms |
+| 8 | 8.1 | 1743 ms | 814 ms |
+
+Throughput is flat across the bounds while per request increases. This may be because each MSM already saturates the machine through rayon, so a larger bound does not add capacity. It just divides the same capacity among more requests and widens the tail(p95 grows by ~70%).
 
 ## Documentation
 
