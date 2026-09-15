@@ -361,6 +361,84 @@ async fn body_size_quota_is_enforced_per_tier() {
     assert_eq!(state.sessions.count_for("alice"), 1);
 }
 
+/// The tier limit must bind on bytes received, not on the length the client
+/// declared.
+///
+/// `Content-Length` is optional: HTTP/1.1 may send `Transfer-Encoding: chunked`
+/// and HTTP/2 never requires it, and the TLS listener offers `h2` first in ALPN.
+/// The middleware check reads only that header, so on its own it lets a chunked
+/// sender upload up to the server-wide transport limit against a tier capped far
+/// below it. A 4096-byte tier accepted a 256 KiB body this way until the handlers
+/// read the body through `TieredBody`. Sending it over a raw socket because
+/// reqwest sets `Content-Length` for every in-memory body.
+#[tokio::test]
+async fn a_chunked_upload_cannot_evade_the_tier_body_limit() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (auth, keys) = auth_store_with_keys(
+        &["alice"],
+        Some("tiny"),
+        tier("tiny", 4, 4096, 1000.0, 1000),
+        AuthMode::ApiKey,
+    );
+    let (url, state) = spawn_with_auth(ServerConfig::default(), auth).await;
+    let key = &keys[0].key;
+    let addr = url.trim_start_matches("http://");
+
+    // Far over the tier limit, far under the server-wide transport limit, so
+    // only the per-principal limit can reject it.
+    let body = generators_body(2000, 72);
+    assert!(body.len() > 4096, "fixture must exceed the tier limit");
+
+    let head = format!(
+        "POST /v1/setup HTTP/1.1\r\n\
+         Host: {addr}\r\n\
+         {VERSION_HEADER}: {PROTOCOL_VERSION}\r\n\
+         Authorization: Bearer {key}\r\n\
+         Content-Type: application/octet-stream\r\n\
+         Transfer-Encoding: chunked\r\n\r\n"
+    );
+    let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (mut rx, mut tx) = tokio::io::split(sock);
+
+    // Write and read at the same time. The server refuses part way through the
+    // upload and closes without draining the rest, so a sequential
+    // write-then-read loses the response to a connection reset.
+    tokio::spawn(async move {
+        let _ = tx.write_all(head.as_bytes()).await;
+        // One chunk holding the whole oversize body, then the terminator.
+        let _ = tx.write_all(format!("{:x}\r\n", body.len()).as_bytes()).await;
+        let _ = tx.write_all(&body).await;
+        let _ = tx.write_all(b"\r\n0\r\n\r\n").await;
+    });
+
+    let mut buf = vec![0u8; 512];
+    let n = rx.read(&mut buf).await.unwrap_or(0);
+    let status = String::from_utf8_lossy(&buf[..n])
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+
+    assert!(
+        status.contains("413"),
+        "chunked upload evaded the tier limit: {status}"
+    );
+    assert_eq!(
+        state.sessions.count_for("alice"),
+        0,
+        "an over-limit body must not reach the handler"
+    );
+    assert_eq!(
+        state
+            .metrics
+            .rejected_body_too_large
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the refusal must be counted"
+    );
+}
+
 /// An unauthenticated flood must not consume a real principal's rate allowance.
 ///
 /// Order of checks matters: authenticate first, then charge quota.

@@ -2,35 +2,18 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use serde::{Deserialize, Serialize};
 
 /// Wire protocol version, sent in the [`VERSION_HEADER`] on every `/v1` request.
-///
-/// bincode is not self-describing: if a message struct gains a field, an older
-/// peer decodes the bytes as *something* rather than failing. An explicit version
-/// turns that silent corruption into a clean rejection. Bump this whenever any
-/// type in this module changes shape, or whenever a header changes meaning.
-///
-/// Version 2 moved the session token out of `Authorization` and into
-/// [`SESSION_HEADER`], because `Authorization` now carries the client credential.
-/// A version 1 client therefore sends its session token where the server expects
-/// an API key; the version check turns that into a clear rejection instead of a
-/// confusing authentication failure.
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Header carrying [`PROTOCOL_VERSION`].
 pub const VERSION_HEADER: &str = "x-stealthsnark-version";
 
 /// Header carrying the session token issued by `/v1/setup`.
-///
-/// Separate from `Authorization` on purpose. `Authorization` says *who you are*
-/// (an API key, or a TLS client certificate); this says *which stored generators
-/// you mean*. Keeping them apart is what lets the server bind a session to its
-/// owner, so a stolen session token is useless without the owner's credential.
 pub const SESSION_HEADER: &str = "x-stealthsnark-session";
 
 /// Maximum number of elements allowed in a deserialized vector.
 /// Prevents unbounded allocation from attacker-controlled length prefixes.
-/// 2^24 elements is the largest LPN parameter table entry.
-///
-/// Note this is a *structural* bound, not the effective one: a request also has
+/// 
+/// Note this is a structural bound and not the effective one because a request also has
 /// to fit under [`crate::protocol::config::ServerConfig::max_body_bytes`], which
 /// is what actually decides the largest servable circuit.
 const MAX_VEC_LEN: u64 = 1 << 24;
@@ -38,15 +21,11 @@ const MAX_VEC_LEN: u64 = 1 << 24;
 /// Maximum number of elements pre-allocated before any element has decoded.
 /// The allocation for a `Vec<T>` is `count * size_of::<T>()`, so deriving the
 /// capacity from untrusted byte counts still amplifies attacker bytes by
-/// `size_of::<T>()` (~136x for G2Affine). Beyond this bound the Vec grows
-/// amortized, which is negligible next to element deserialization.
+/// `size_of::<T>()` (~136x for G2Affine). 
+/// Beyond this bound, the Vec grows amortized, which is negligible compared to deserialization.
 const MAX_PREALLOC_ELEMS: usize = 1024;
 
 /// Serialize an arkworks type to bytes.
-///
-/// Fallible for the same reason the deserializers are: this runs on the server's
-/// response path, and a library function that aborts the process on an
-/// unexpected input is the wrong failure mode even when the input is our own.
 pub fn ark_to_bytes<T: CanonicalSerialize>(val: &T) -> Result<Vec<u8>, anyhow::Error> {
     let mut buf = Vec::new();
     val.serialize_compressed(&mut buf)
@@ -55,14 +34,11 @@ pub fn ark_to_bytes<T: CanonicalSerialize>(val: &T) -> Result<Vec<u8>, anyhow::E
 }
 
 /// Deserialize an arkworks type from bytes.
-/// Returns an error instead of panicking on malformed input.
 pub fn ark_from_bytes<T: CanonicalDeserialize>(bytes: &[u8]) -> Result<T, anyhow::Error> {
     T::deserialize_compressed(bytes).map_err(|e| anyhow::anyhow!("deserialization failed: {e}"))
 }
 
 /// Serialize a vector of arkworks types to bytes.
-///
-/// Fallible for the same reason as [`ark_to_bytes`].
 pub fn ark_vec_to_bytes<T: CanonicalSerialize>(vals: &[T]) -> Result<Vec<u8>, anyhow::Error> {
     let mut buf = Vec::new();
     let len = vals.len() as u64;
@@ -84,14 +60,7 @@ pub fn ark_vec_from_bytes<T: CanonicalDeserialize>(bytes: &[u8]) -> Result<Vec<T
     if len > MAX_VEC_LEN {
         anyhow::bail!("vec length {len} exceeds maximum {MAX_VEC_LEN}");
     }
-    // Do NOT pre-allocate based on untrusted input: the length prefix is
-    // attacker-controlled, and even the remaining byte count is a bad bound
-    // because the allocation is `count * size_of::<T>()` — for G2Affine that
-    // is ~136 bytes per *input byte*, letting a few-MB body force a
-    // hundreds-of-MB allocation before the first decode fails
-    // (memory-amplification DoS). Cap the initial capacity at a small constant
-    // and let the Vec grow amortized as elements actually decode; the growth
-    // cost is negligible next to point decompression.
+
     let cap = (len as usize).min(cursor.len()).min(MAX_PREALLOC_ELEMS);
     let mut vals = Vec::with_capacity(cap);
     for i in 0..len {
@@ -110,20 +79,17 @@ pub fn ark_vec_from_bytes<T: CanonicalDeserialize>(bytes: &[u8]) -> Result<Vec<T
 /// against attacker-supplied bases.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SetupResponse {
-    /// Bearer credential for `/v1/prove` and `/v1/session`. Treat as a secret:
-    /// do not log it, and do not persist it beyond the session.
+    /// Bearer credential for `/v1/prove` and `/v1/session`.
     pub session_token: String,
     /// Short non-secret id that the server also logs, so a client and an operator
-    /// can correlate a request without the token ever reaching a log sink.
+    /// can correlate a request.
     pub session_label: String,
 }
 
 /// Response to `DELETE /v1/sessions`: how many sessions were released.
 ///
 /// A new type rather than an empty 204, because the count is the only way a client
-/// that lost its tokens learns whether it had anything to reclaim. Adding an
-/// endpoint does not need a [`PROTOCOL_VERSION`] bump: an older client simply
-/// never calls it, and no existing type changed shape.
+/// that lost its tokens learns whether it had anything to reclaim.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReleaseAllResponse {
     pub released: u32,
@@ -236,13 +202,11 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // Regression test for the memory amplification DoS found by `vec_deser`
     #[test]
     fn test_huge_length_prefix_tiny_body_does_not_overallocate() {
-        // Regression for an OOM found by the `vec_deser` fuzzer: a length prefix
-        // at the maximum (2^24) with an empty body must fail fast WITHOUT
-        // pre-allocating gigabytes. We assert it returns an error quickly; if the
-        // capacity were driven by `len` alone this would attempt a ~1.5 GB
-        // allocation for G2Affine.
+        // a length prefix at the maximum (2^24) with an empty body 
+        // must fail fast WITHOUT pre-allocating gigabytes. 
         let mut buf = Vec::new();
         let huge_len: u64 = MAX_VEC_LEN; // within the cap, but no elements follow
         ark_serialize::CanonicalSerialize::serialize_compressed(&huge_len, &mut buf).unwrap();
@@ -251,10 +215,6 @@ mod tests {
         let r2: Result<Vec<G1Affine>, _> = ark_vec_from_bytes(&buf);
         assert!(r2.is_err());
 
-        // Variant: a multi-KB junk body. Bounding the capacity by the remaining
-        // *byte* count alone would still allocate body_len * size_of::<T>()
-        // (~136x amplification for G2Affine); the MAX_PREALLOC_ELEMS cap keeps
-        // the upfront allocation constant regardless of body size.
         buf.extend(std::iter::repeat_n(0xAAu8, 64 * 1024));
         let r3: Result<Vec<G1Affine>, _> = ark_vec_from_bytes(&buf);
         assert!(r3.is_err());

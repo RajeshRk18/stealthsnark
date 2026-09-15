@@ -2,16 +2,12 @@
 //!
 //! A cheating server returns a tampered set of MSM results. The double-query
 //! consistency check must catch this. The invariant enforced here:
+//! INVARIANTS:
+//!   - untampered response must return valid decryption, and proof should verify
+//!   - any tampered response must be rejected in decryption.
 //!
-//!   * untampered response => decrypt Ok, proof verifies (and is bound to the
-//!     correct public input);
-//!   * any tampered response => decrypt must reject. Random offsets pass the
-//!     check only with probability ~2^-254, so an Ok on tampered input is a
-//!     detection bug, not bad luck — the fuzzer hunts for check-bypassing
-//!     inputs directly.
-//!
-//! Setup is built once; each run copies the honest response, applies fuzz-driven
-//! tampering, and re-runs decryption — so iterations are cheap (no MSMs).
+//! Setup is built only once in `fixture`. Each run copies the honest response, applies
+//! tampering, and re-runs decryption so iterations are fast and cheap.
 #![no_main]
 
 use std::sync::OnceLock;
@@ -127,10 +123,8 @@ fuzz_target!(|data: &[u8]| {
         }
         (0, Err(e)) => panic!("untampered response rejected: {e:?}"),
         (n, Ok(_)) => {
-            // Random offsets pass the consistency check only with probability
-            // ~2^-254, so any Ok here is a detection bug — including tampers
-            // that would still yield a verifying proof (e.g. `_ck`-only
-            // components, which never enter proof assembly).
+            // SOUNDNESS BREAK: Random offsets pass the consistency check only with probability
+            // ~2^-254, so any Ok here is a detection bug that would still produce a verifying proof
             panic!("tampering {n} component(s) (mask {mask:#012b}) was NOT detected");
         }
         (_, Err(_)) => { /* expected: tampering detected */ }

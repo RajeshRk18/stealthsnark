@@ -3,13 +3,6 @@
 //! Hand-rolled over atomics rather than pulling in a metrics framework: the
 //! surface is nine counters and the render is a `write!` loop, which is a lot
 //! cheaper than the dependency.
-//!
-//! The counter that matters most is [`Metrics::consistency_check_failures`].
-//! In malicious-secure mode the client cross-checks two independent queries per
-//! MSM; a mismatch means the server returned inconsistent results, i.e. it
-//! cheated or corrupted data. That is the single most important signal this
-//! system can emit, and until now it existed only as a `Result` on the client
-//! side that nothing aggregated.
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,7 +40,7 @@ pub struct Metrics {
     pub rejected_body_too_large: AtomicU64,
 
     /// Malicious-mode consistency check failures. Non-zero means a server
-    /// returned inconsistent MSM results. Alert on any increase.
+    /// returned inconsistent MSM results.
     pub consistency_check_failures: AtomicU64,
 }
 
@@ -233,10 +226,7 @@ mod tests {
         m.record_rejection(&ApiError::RateLimited {
             retry_after_secs: 1,
         });
-        m.record_rejection(&ApiError::BodyTooLarge {
-            limit_bytes: 1,
-            got_bytes: 2,
-        });
+        m.record_rejection(&ApiError::BodyTooLarge { limit_bytes: 1 });
 
         assert_eq!(m.rejected_unauthenticated.load(Ordering::Relaxed), 1);
         assert_eq!(m.rejected_forbidden.load(Ordering::Relaxed), 1);

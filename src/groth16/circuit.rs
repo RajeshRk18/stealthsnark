@@ -6,6 +6,7 @@ use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisE
 /// Demo circuit: x^3 + x + 5 = y
 /// Private input: x
 /// Public input: y
+/// Demo 
 #[derive(Clone)]
 pub struct CubeCircuit<F: PrimeField> {
     pub x: Option<F>,

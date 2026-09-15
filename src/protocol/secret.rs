@@ -1,16 +1,6 @@
-//! Primitives for handling secrets: random generation, hex coding, digests, and
-//! constant-time comparison.
-//!
-//! Collected in one place so that every credential in the service is generated
-//! and compared the same way. Session tokens and API keys both depend on this.
-
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-/// Generate `n_bytes` from the OS CSPRNG and return them hex-encoded.
-///
-/// `OsRng` and not a seeded generator: these values are credentials, and a
-/// reproducible credential is not a credential.
 pub fn random_hex(n_bytes: usize) -> String {
     use rand::rngs::OsRng;
     use rand::RngCore;
@@ -29,8 +19,6 @@ pub fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// Decode lowercase or uppercase hex. Returns `None` on odd length or a
-/// non-hex digit.
 pub fn hex_decode(text: &str) -> Option<Vec<u8>> {
     if !text.len().is_multiple_of(2) {
         return None;
@@ -45,11 +33,6 @@ pub fn hex_decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// SHA-256 of `bytes`, hex-encoded.
-///
-/// One unsalted digest round is the right choice for a high-entropy random API
-/// key: there is no dictionary to attack, so a slow password hash would only add
-/// latency to every request. A user-chosen password would need Argon2 instead.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex_encode(&digest)
@@ -57,9 +40,10 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Compare two hex strings in constant time with respect to their contents.
 ///
-/// The length comparison is not constant-time, which is intended: the length of
-/// a digest is public. What must not leak is *where* two digests first differ,
-/// because that turns key recovery into a byte-at-a-time search.
+/// **NOTE:** This must be used to compare digest strings.
+/// 
+/// The length comparison is not constant-time because this is used to
+/// compare sha256 digest. Its length is public. 
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {

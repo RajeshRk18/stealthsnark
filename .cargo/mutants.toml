@@ -1,30 +1,21 @@
 # cargo-mutants configuration.
 #
-# Mutation testing answers "do the tests actually catch a broken implementation?"
-# We focus it on the soundness- and privacy-critical core: a mutant that SURVIVES
-# in one of these files means the test suite has a blind spot in exactly the place
-# where a real bug is catastrophic (a forged proof, a leaked witness, an
-# undetected cheating server).
-#
-# Install:  cargo install cargo-mutants
-# Run:      cargo mutants            (uses this config)
-#           cargo mutants --file src/emsm/malicious.rs   (one file)
+# a mutant that survives in one of these files means the test suite has a blind spot
 
 examine_globs = [
-    "src/emsm/emsm.rs",          # encrypt / decrypt (mask removal formula)
-    "src/emsm/malicious.rs",     # consistency check — the soundness guard
+    "src/emsm/emsm.rs",          # encryption/decryption
+    "src/emsm/malicious.rs",     # consistency check
     "src/emsm/dual_lpn.rs",      # masking
     "src/emsm/raa_code.rs",      # RAA code arithmetic
     "src/emsm/pedersen.rs",      # MSM wrapper + length checks
-    "src/groth16/server_aided.rs", # proof assembly
-    # Session bookkeeping is a security boundary, not glue: a surviving mutant
-    # here means the tests would not notice a session becoming shareable,
-    # unexpirable, or uncapped.
-    "src/protocol/session.rs",
+    "src/groth16/server_aided.rs", # proof pipeline
+    "src/protocol/session.rs", # secure access, resource ownership
 ]
 
-# Lower-value / noisy targets: networking glue, binaries, the hardcoded param
-# table, and the circom path (needs external artifacts).
+# Low value and noisy targets. Mutation generator may find dozens of candidates
+# on some of these files so it will take a long of time. I decided to prioritize cryptography/security targets
+# Still this is not an excuse to not perform mutation testing on these files.
+# Run separately with `cargo mutants --no-config --file src/protocol/server.rs`  
 exclude_globs = [
     "src/bin/**",
     "src/protocol/client.rs",
@@ -37,7 +28,7 @@ exclude_globs = [
     "src/emsm/params.rs",
 ]
 
-# Groth16 setup makes each test run a few seconds; give mutants headroom so a
-# slow-but-correct run isn't misreported as "caught by timeout".
+# Groth16 setup makes each test run a few seconds
+# give mutants headroom so a slow-but-correct run isn't misreported as caught by timeout.
 timeout_multiplier = 3.0
 minimum_test_timeout = 180

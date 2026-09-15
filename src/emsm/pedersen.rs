@@ -3,7 +3,7 @@ use ark_std::rand::Rng;
 
 use super::sparse_vec::SparseVector;
 
-/// Pedersen-style commitment scheme: MSM wrapper over generators.
+/// Pedersen-style commitment scheme
 #[derive(Clone, Debug)]
 pub struct Pedersen<G: CurveGroup> {
     pub generators: Vec<G::Affine>,
@@ -21,7 +21,7 @@ impl<G: CurveGroup> Pedersen<G> {
         Self { generators }
     }
 
-    /// Compute MSM: sum(scalars[i] * generators[i]).
+    /// Compute sum(scalars[i] * generators[i]).
     /// Returns an error if lengths don't match.
     pub fn commit(&self, scalars: &[G::ScalarField]) -> Result<G, PedersenError> {
         if scalars.len() != self.generators.len() {
@@ -33,7 +33,7 @@ impl<G: CurveGroup> Pedersen<G> {
         G::msm(&self.generators, scalars).map_err(|_| PedersenError::MsmFailed)
     }
 
-    /// Compute sparse MSM: sum over nonzero entries only.
+    /// Compute sparse MSM
     pub fn commit_sparse(&self, sparse: &SparseVector<G::ScalarField>) -> G {
         assert!(sparse.size <= self.generators.len());
         if sparse.entries.is_empty() {

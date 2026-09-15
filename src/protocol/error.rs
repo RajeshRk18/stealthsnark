@@ -1,11 +1,3 @@
-//! Typed API errors.
-//!
-//! The previous handlers returned a bare `StatusCode` for every failure, so a
-//! client could not tell "scalar/generator length mismatch" from "bad point
-//! encoding" from "corrupt bincode" — three problems with three different fixes,
-//! one indistinguishable response. Each variant here carries a stable
-//! machine-readable `code` that clients can branch on, plus prose for humans.
-
 use axum::http::{
     header::{RETRY_AFTER, WWW_AUTHENTICATE},
     HeaderValue, StatusCode,
@@ -41,10 +33,8 @@ pub enum ApiError {
     #[error("session quota exceeded: this client may hold at most {limit} sessions")]
     SessionQuotaExceeded { limit: usize },
 
-    #[error(
-        "request body of {got_bytes} bytes exceeds the {limit_bytes} byte limit for this client"
-    )]
-    BodyTooLarge { limit_bytes: u64, got_bytes: u64 },
+    #[error("request body exceeds the {limit_bytes} byte limit for this client")]
+    BodyTooLarge { limit_bytes: u64 },
 
     #[error(
         "missing or malformed session token (expected the `{}` header)",
@@ -191,10 +181,7 @@ pub(crate) mod tests {
                 retry_after_secs: 7,
             },
             ApiError::SessionQuotaExceeded { limit: 4 },
-            ApiError::BodyTooLarge {
-                limit_bytes: 10,
-                got_bytes: 11,
-            },
+            ApiError::BodyTooLarge { limit_bytes: 10 },
             ApiError::MissingToken,
             ApiError::UnknownSession,
             ApiError::InvalidInput(String::new()),
@@ -262,10 +249,7 @@ pub(crate) mod tests {
 
     #[test]
     fn oversize_body_is_413_and_not_retryable() {
-        let e = ApiError::BodyTooLarge {
-            limit_bytes: 1024,
-            got_bytes: 2048,
-        };
+        let e = ApiError::BodyTooLarge { limit_bytes: 1024 };
         assert_eq!(e.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert!(!e.is_retryable(), "the same body will not fit next time");
         // The client needs the limit to adapt, so it must be in the message.

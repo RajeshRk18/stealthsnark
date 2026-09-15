@@ -2,15 +2,10 @@
 //!
 //! # Credentials
 //!
-//! Two independent things, in two headers, matching the server:
+//! - client credential goes in `Authorization: Bearer <api key>`, or is
+//!   supplied by a TLS client certificate under mTLS.
+//! - The session token goes in `x-stealthsnark-session`.
 //!
-//! - The **client credential** goes in `Authorization: Bearer <api key>`, or is
-//!   supplied by a TLS client certificate under mTLS. It says who you are.
-//! - The **session token** goes in `x-stealthsnark-session`, is issued by
-//!   `/v1/setup`, and is held here. It says which stored generators you mean.
-//!
-//! `send_prove` refuses to run without a session, so "forgot to set up" is a
-//! local error rather than a puzzling 401 from the server.
 
 use std::path::Path;
 use std::time::Duration;
@@ -24,9 +19,7 @@ use super::messages::{
 
 /// Default per-request ceiling.
 ///
-/// Generous because a large honest MSM legitimately takes minutes; the point is
-/// to have a bound, since `reqwest::Client::new()` has none and a stalled server
-/// would otherwise hang a client for ever.
+/// Generous because a large honest MSM may takes minutes
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Connect timeout. Short, because a TCP connection that will not establish does
@@ -47,9 +40,6 @@ pub enum Credential {
 }
 
 /// Builder for [`EmsmClient`].
-///
-/// A builder rather than a widening list of `new` arguments, because TLS trust,
-/// client certificates, and timeouts are independent choices.
 #[derive(Debug)]
 pub struct EmsmClientBuilder {
     base_url: String,
@@ -119,11 +109,11 @@ impl EmsmClientBuilder {
             .use_rustls_tls();
 
         if let Some(pem) = &self.root_certificate_pem {
-            // A CA bundle may hold several certificates; add all of them.
             let certs = reqwest::Certificate::from_pem_bundle(pem)?;
-            // An unparseable bundle yields an empty list rather than an error, so
-            // without this check the client would quietly keep only the public
-            // roots and then fail verification with a misleading message.
+
+            // Invalid/empty custom bundle returns an empty list.
+            // With this, we return early with a config error rather than a network error later.
+            // The connection can be still successful if the server uses public root certificates as most servers do.
             if certs.is_empty() {
                 anyhow::bail!("no certificates found in the supplied CA bundle");
             }
@@ -145,12 +135,11 @@ impl EmsmClientBuilder {
     }
 }
 
-/// A client bound to one server-issued session.
+/// A client bound to a server-issued session.
 pub struct EmsmClient {
     base_url: String,
     client: reqwest::Client,
     credential: Credential,
-    /// Set by [`EmsmClient::send_setup`]. `None` until then.
     session_token: Option<String>,
     session_label: Option<String>,
 }
@@ -199,7 +188,7 @@ impl EmsmClient {
         self.session_token.is_some()
     }
 
-    /// `POST /v1/setup` — upload generators and store the returned token.
+    /// `POST /v1/setup` upload generators and store the returned token.
     pub async fn send_setup(&mut self, request: &SetupRequest) -> Result<()> {
         let body = bincode::serialize(request)?;
         let resp = self
@@ -216,7 +205,7 @@ impl EmsmClient {
         Ok(())
     }
 
-    /// `POST /v1/prove` — send masked vectors, receive the five MSM results.
+    /// `POST /v1/prove` send masked vectors and receive the five MSM results.
     pub async fn send_prove(&self, request: &ProveRequest) -> Result<ProveResponse> {
         let body = bincode::serialize(request)?;
         let resp = self
@@ -231,12 +220,14 @@ impl EmsmClient {
         Ok(bincode::deserialize(&bytes)?)
     }
 
-    /// `DELETE /v1/session` — free the server's copy of the generators now,
-    /// instead of leaving them pinned until the idle timeout expires.
+    /// `DELETE /v1/session` free the server's copy of the generators
     ///
-    /// Clears the local token on success. The token is dead server-side, so
-    /// keeping it would turn the next call into a puzzling 401 instead of a clear
-    /// local error.
+    /// Rationale behind this API:
+    ///     - Client actively makes a request to clear its session data in the server. 
+    ///       This is just an "optimization" and not the only way to clear session data.
+    ///       Server releases once TTL/idle timeout expires anyway.
+    /// Clears the local token on success. The token is released from the server, so
+    /// keeping it would turn the next call into a 401.
     pub async fn release(&mut self) -> Result<()> {
         let resp = self
             .request(reqwest::Method::DELETE, "/v1/session")
@@ -248,7 +239,7 @@ impl EmsmClient {
         Ok(())
     }
 
-    /// `DELETE /v1/sessions` — release every session this client owns on the
+    /// `DELETE /v1/sessions` release every session this client owns on the
     /// server. Returns how many were released.
     ///
     /// Needs no session token, only the client credential. Use it after a restart:
@@ -289,12 +280,12 @@ impl EmsmClient {
     fn token(&self) -> Result<&str> {
         self.session_token
             .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("no session: call send_setup first"))
+            .ok_or_else(|| anyhow::anyhow!("no session yet. call send_setup first"))
     }
 }
 
 /// Turn a non-2xx response into an error carrying the server's structured
-/// `{code, message}` body, so a caller sees why it failed rather than only a
+/// `{code, message}` body, so a caller can see why it failed rather than only a
 /// status number.
 async fn read_success(resp: reqwest::Response, op: &str) -> Result<Vec<u8>> {
     let status = resp.status();

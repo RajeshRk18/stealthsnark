@@ -1,43 +1,26 @@
 //! Request middleware and extractors for the data plane.
 //!
-//! # Why this replaced inline checks
 //!
-//! Version 1 called `require_version(&headers)?` and `bearer_token(&headers)?` by
-//! hand at the top of every handler. That works only while every handler
-//! remembers, and a new handler that forgets silently has no authentication —
-//! the failure is invisible in review because the missing code is not there to
-//! read.
-//!
-//! Here, authentication runs once as a middleware layer over the whole `/v1`
+//! Authentication runs once as a middleware layer over the whole `/v1`
 //! router, and a handler states its requirements in its own signature:
 //!
 //! ```ignore
 //! async fn handle_prove(
-//!     ApiVersion: ApiVersion,      // version negotiated
+//!     ApiVersion: ApiVersion,      // version
 //!     Caller(principal): Caller,   // authenticated
 //!     session: OwnedSession,       // authorised for this session
 //!     body: Bytes,
 //! ) -> Result<Bytes, ApiError>
 //! ```
-//!
-//! A handler cannot be written without naming what it needs, so the type system
-//! carries the requirement instead of a convention.
-//!
-//! # Order of checks
-//!
-//! The middleware runs before any handler and in a fixed order, because the cost
-//! of each step rises: protocol version, then credential, then rate limit, then
-//! body size. A rate-limited caller never reaches quota accounting, and an
-//! unauthenticated one never consumes a rate token, so an anonymous flood cannot
-//! exhaust a real principal's allowance.
 
 use std::sync::Arc;
 
-use axum::extract::{FromRequestParts, Request, State};
+use axum::extract::{FromRequest, FromRequestParts, Request, State};
 use axum::http::request::Parts;
 use axum::http::{header::AUTHORIZATION, HeaderMap};
 use axum::middleware::Next;
 use axum::response::Response;
+use axum::body::Bytes;
 
 use super::auth::Principal;
 use super::error::ApiError;
@@ -45,7 +28,6 @@ use super::messages::{PROTOCOL_VERSION, SESSION_HEADER, VERSION_HEADER};
 use super::server::AppState;
 use super::session::Session;
 
-/// Evidence that the caller speaks this protocol version.
 #[derive(Clone, Copy, Debug)]
 pub struct ApiVersion;
 
@@ -53,20 +35,43 @@ pub struct ApiVersion;
 #[derive(Clone, Debug)]
 pub struct Caller(pub Arc<Principal>);
 
+/// A request body read under the caller's own tier limit.
+///
+/// `DefaultBodyLimit` can only apply one global ceiling, and the
+/// `Content-Length` check in [`authenticate`] is skipped entirely by a chunked
+/// or HTTP/2 sender that declares no length. This reads the body itself and
+/// stops at `min(tier, transport)`
+pub struct TieredBody(pub Bytes);
+
+impl FromRequest<AppState> for TieredBody {
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, app: &AppState) -> Result<Self, Self::Rejection> {
+        let (mut parts, body) = req.into_parts();
+        let Caller(principal) = Caller::from_request_parts(&mut parts, app).await?;
+        let limit = principal.tier.max_body_bytes.min(app.config.max_body_bytes);
+
+        axum::body::to_bytes(body, limit)
+            .await
+            .map(TieredBody)
+            .map_err(|_| {
+                app.reject(ApiError::BodyTooLarge {
+                    limit_bytes: limit as u64,
+                })
+            })
+    }
+}
+
 /// A session the caller is proven to own.
 ///
-/// No `Debug`: it holds the session token, which is a credential, and
-/// `Session` holds millions of curve points.
+/// No `Debug` because it holds the session token which is a credential, and
+/// also `Session` holds millions of curve points.
 #[derive(Clone)]
 pub struct OwnedSession {
     pub token: String,
     pub session: Arc<Session>,
 }
 
-/// Middleware over `/v1`: negotiate the version, authenticate, charge quota.
-///
-/// Applied once as a layer so that it cannot be omitted per route. The resolved
-/// [`Principal`] is placed in the request extensions for the extractors below.
 pub async fn authenticate(
     State(app): State<AppState>,
     mut request: Request,
@@ -74,8 +79,7 @@ pub async fn authenticate(
 ) -> Result<Response, ApiError> {
     require_version(request.headers())?;
 
-    // A client certificate is inserted by the TLS listener when the handshake
-    // supplied one. Plain HTTP never has it.
+    // A client certificate is inserted by the TLS listener when the handshake supplied one.
     #[cfg(feature = "tls")]
     let cert_digest = request
         .extensions()
@@ -91,14 +95,10 @@ pub async fn authenticate(
         .authenticate(presented_key.as_deref(), cert_digest.as_deref())
         .map_err(|e| app.reject(e))?;
 
-    // Rate limit only after the caller is known, so one principal cannot spend
-    // another's allowance, and an unauthenticated flood cannot spend anyone's.
     app.quota
         .check_rate(&principal)
         .map_err(|e| app.reject(e))?;
 
-    // Body size from Content-Length, before the body is read. The transport limit
-    // is the backstop for a chunked or dishonest sender.
     app.quota
         .check_body_size(&principal, content_length(request.headers()))
         .map_err(|e| app.reject(e))?;

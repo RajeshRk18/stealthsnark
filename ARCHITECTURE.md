@@ -1,9 +1,5 @@
 # StealthSnark Architecture
 
-How the server is built and why. For operators, see the configuration and API
-sections of [README.md](README.md). For how each property is tested, see
-[VERIFICATION.md](VERIFICATION.md). This file does not repeat either.
-
 ## 1. What shapes the design
 
 The client offloads five multi-scalar multiplications (MSMs) per Groth16 proof.
@@ -186,7 +182,7 @@ exist is rejected by the middleware before the router can produce a 404. An
 unauthenticated caller therefore cannot enumerate which paths exist. A 404 is only
 observable with a valid version header.
 
-### 5.3 Why the check is a layer, not a call in each handler
+### 5.3 Why the check is a layer and not a call in each handler?
 
 The first version called `require_version(&headers)?` and `bearer_token(&headers)?`
 by hand at the top of every handler. That works exactly as long as every handler
@@ -223,7 +219,6 @@ step 2 and never touches any principal's bucket.
 
 ## 6. Concurrency model
 
-This is the part most likely to be broken by a later change.
 
 ### 6.1 The async and blocking boundary
 
@@ -239,15 +234,12 @@ This is the part most likely to be broken by a later change.
  write response      ◄──────────────────────┘
 ```
 
-An MSM takes seconds to minutes. Point decoding likewise. In an `async fn` with no
-await point, that occupies a tokio worker for the whole duration. With
-`worker_threads` equal to core count, a few concurrent requests starve the
-runtime, including the health endpoints, so an orchestrator cannot discover the
-process is wedged and a load balancer keeps sending traffic.
+An MSM takes seconds to minutes. In an `async fn` with noawait point, that occupies a tokio worker for the whole duration. With `worker_threads` equal to core count, a few concurrent requests starve the
+runtime, including the health endpoints, so an orchestrator cannot discover the process is wedged and a load balancer keeps sending traffic.
 
 The non-obvious half is that deserialization had to move as well, not only the
 MSM. `deserialize_compressed` performs an on-curve check and a subgroup check per
-point. It is not parsing; it is cryptographic work.
+point. It is not parsing; it is quite heavy cryptographic work.
 
 ### 6.2 Admission control
 

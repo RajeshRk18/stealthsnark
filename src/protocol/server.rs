@@ -29,9 +29,8 @@
 //!
 //! **No CPU work runs on the async runtime.** Point deserialization performs
 //! on-curve and subgroup checks per point, and MSM evaluation takes seconds to
-//! minutes. Both in an `async fn` block a tokio worker, and enough concurrent
-//! requests starve the runtime — including the health endpoints, so an
-//! orchestrator cannot tell the process is wedged. Everything expensive runs in
+//! even minutes. Both in an `async fn` block a tokio worker, and enough concurrent
+//! requests starve the runtime including the health endpoints. Everything expensive runs in
 //! [`tokio::task::spawn_blocking`].
 //!
 //! **Locks are never held across expensive work.** `/v1/prove` takes a read lock
@@ -58,13 +57,13 @@ use tower_http::trace::TraceLayer;
 use super::auth::AuthStore;
 use super::config::ServerConfig;
 use super::error::ApiError;
-use super::extract::{ApiVersion, Caller, OwnedSession};
+use super::extract::{ApiVersion, Caller, TieredBody, OwnedSession};
 use super::messages::*;
 use super::metrics::Metrics;
 use super::quota::QuotaEnforcer;
 use super::session::{Generators, Session, SessionStore};
 
-/// Shared server state. Cheap to clone — every field is behind an `Arc`.
+/// Shared server state.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<ServerConfig>,
@@ -129,15 +128,13 @@ impl AppState {
     }
 }
 
-/// Build the data-plane router: `/v1/*`, authenticated.
+/// Build the data-plane router.
 pub fn create_router(state: AppState) -> Router {
     let cfg = state.config.clone();
 
-    // The server-wide limit is the hard ceiling; a tier can only be more
-    // restrictive. The quota middleware applies each principal's own smaller
-    // limit afterwards, so a small tier still gets a small cap. `serve` warns if
-    // a tier is configured above this value, because that part of it is
-    // unreachable.
+    // The server-wide limit is the hard ceiling.
+    // The quota middleware applies each principal's own smaller
+    // limit, so a small tier still gets a small cap.
     let transport_limit = cfg.max_body_bytes;
 
     let routes = Router::new()
@@ -151,48 +148,47 @@ pub fn create_router(state: AppState) -> Router {
             state.clone(),
             super::extract::authenticate,
         ))
-        // axum's default body limit is 2 MiB, which rejects any circuit needing
-        // more than roughly 16k generators per MSM — every circuit worth
-        // outsourcing.
+        // we dont need this anymore because the body size check
+        // is enforced in the extractor via `TieredBody`. But I am keeping this
+        // so if any future route uses Bytes  directly
         .layer(DefaultBodyLimit::max(transport_limit));
 
     with_common_layers(routes, &cfg).with_state(state)
 }
 
-/// Build the admin-plane router: health and metrics, no credential.
+/// Build the admin-plane router.
 pub fn create_admin_router(state: AppState) -> Router {
     let cfg = state.config.clone();
     let routes = Router::new()
         .route("/livez", get(handle_livez))
         .route("/readyz", get(handle_readyz))
         .route("/metrics", get(handle_metrics));
-
+        // No auth and rate-limit
     with_common_layers(routes, &cfg).with_state(state)
 }
 
 /// Apply the middleware shared by both planes.
 ///
 /// **Each `.layer()` wraps the previous one, so the last call is the outermost**
-/// and a request traverses them bottom-up:
+/// and a request traverses them in the order below:
 ///
 /// ```text
 /// request  -> SetRequestId -> Trace -> PropagateRequestId -> Timeout -> CatchPanic -> handler
 /// ```
 ///
-/// That ordering is deliberate in two places. `SetRequestId` must be outermost so
-/// that `Trace` below it can attach the id to every log line for the request, and
-/// so `PropagateRequestId` finds an id to copy onto the response (verified: every
-/// response carries `x-request-id`). `CatchPanic` sits innermost, placed directly
-/// around the handler where a panic can realistically happen, so a bad request
-/// becomes a single 500 rather than a dead process.
+/// Ordering Rationale:  
+/// `SetRequestId` must be outermost so that `Trace` below it can attach 
+/// the id to every log line for the request, and so `PropagateRequestId` 
+/// finds an id to copy onto the response. 
+/// `CatchPanic` is placed directly around the handler where a panic can happen, 
+/// so a bad request becomes a single 500 rather than a dead process.
 fn with_common_layers<S>(router: Router<S>, cfg: &ServerConfig) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     router
         .layer(CatchPanicLayer::new())
-        // 503 rather than the default 408: a timed-out MSM is a server-side
-        // condition, and the client may retry it.
+        // send 503 on a timed-out MSM. 
         .layer(TimeoutLayer::with_status_code(
             StatusCode::SERVICE_UNAVAILABLE,
             cfg.request_timeout,
@@ -202,7 +198,6 @@ where
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
 }
 
-/// Bind both planes, serve, and drain on SIGINT or SIGTERM.
 pub async fn serve(state: AppState) -> anyhow::Result<()> {
     let cfg = state.config.clone();
 
@@ -235,11 +230,14 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
     if !cfg.auth_mode.is_enabled() {
         // Loud because `validate` only permits this on loopback and an operator
         // who did not intend it should see it immediately.
-        tracing::warn!("authentication is DISABLED; every caller is the `anonymous` principal");
+        tracing::warn!("authentication is DISABLED. Every caller is the `anonymous` principal");
     }
+
+    // this is UNSAFE until a reverse proxy is implemented for stealthsnark server.
+    // this config is caught in ServerConfig::Validate anyway.
     if !cfg.tls_enabled() {
         tracing::warn!(
-            "TLS is not configured; the data plane serves plain HTTP and expects a \
+            "TLS is not configured. The data plane serves plain HTTP and expects a \
              proxy to terminate TLS"
         );
     }
@@ -417,11 +415,6 @@ async fn shutdown_flag(state: AppState) {
 }
 
 /// Wait for a stop signal, then mark the server unready.
-///
-/// `/readyz` fails before the listener closes, so a load balancer drains traffic
-/// while in-flight proofs finish. Cutting a proof short is the most expensive
-/// thing that can be discarded here: the client has already paid for a trusted
-/// setup and a large upload.
 async fn shutdown_signal(state: AppState) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -532,12 +525,12 @@ async fn handle_metrics(State(app): State<AppState>) -> impl IntoResponse {
 // Data-plane handlers
 // ---------------------------------------------------------------------------
 
-/// `POST /v1/setup` — store generators, return a session token.
+/// `POST /v1/setup`. It stores generators, return a session token.
 async fn handle_setup(
     State(app): State<AppState>,
     _version: ApiVersion,
     Caller(principal): Caller,
-    body: Bytes,
+    TieredBody(body): TieredBody,
 ) -> Result<Bytes, ApiError> {
     // Charge the session quota before decoding, so an over-quota caller does not
     // get megabytes of point validation done for free.
@@ -547,8 +540,7 @@ async fn handle_setup(
         return Err(app.reject(e));
     }
 
-    // Decoding generators is heavy (subgroup checks per point), so it takes an
-    // admission slot just as proving does.
+    // takes an admission slot because decoding generators is heavy
     let permit = app.acquire_msm_slot().await.map_err(|e| {
         app.metrics.setup_err.fetch_add(1, Ordering::Relaxed);
         app.reject(e)
@@ -582,7 +574,6 @@ async fn handle_setup(
     };
 
     app.metrics.setup_ok.fetch_add(1, Ordering::Relaxed);
-    // `label`, never `token`: the token is a credential.
     tracing::info!(
         principal = %principal.id,
         tier = %principal.tier.name,
@@ -603,13 +594,13 @@ async fn handle_setup(
     Ok(Bytes::from(encode(&response)?))
 }
 
-/// `POST /v1/prove` — evaluate the five MSMs for an owned session.
+/// `POST /v1/prove`. It evaluates the five MSMs for an owned session.
 async fn handle_prove(
     State(app): State<AppState>,
     _version: ApiVersion,
     Caller(principal): Caller,
     owned: OwnedSession,
-    body: Bytes,
+    TieredBody(body): TieredBody,
 ) -> Result<Bytes, ApiError> {
     let permit = app.acquire_msm_slot().await.map_err(|e| {
         app.metrics.prove_err.fetch_add(1, Ordering::Relaxed);
@@ -648,7 +639,7 @@ async fn handle_prove(
     Ok(Bytes::from(bytes))
 }
 
-/// `DELETE /v1/session` — release generators without waiting for the TTL.
+/// `DELETE /v1/session`. It releases generators without waiting for the TTL.
 async fn handle_release(
     State(app): State<AppState>,
     _version: ApiVersion,
@@ -669,14 +660,12 @@ async fn handle_release(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `DELETE /v1/sessions` — release every session owned by the caller.
+/// `DELETE /v1/sessions`. It releases every session owned by the caller.
 ///
-/// Takes no session token, only the client credential. That is the point: a
-/// client that crashed has lost its tokens, but its sessions still count against
+/// Takes no session token, only the client credential.
+/// It is useful when a client that crashed has lost its tokens, but its sessions still count against
 /// its quota until they time out. This lets it reclaim its own allowance with the
 /// credential that survived the restart.
-///
-/// Scoped to the caller by construction, so it cannot affect another client.
 async fn handle_release_all(
     State(app): State<AppState>,
     _version: ApiVersion,
@@ -710,9 +699,9 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, ApiError> {
     bincode::deserialize(bytes).map_err(|e| ApiError::MalformedBody(e.to_string()))
 }
 
-// ---------------------------------------------------------------------------
-// Blocking compute — runs on the blocking pool, never the async runtime
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// CPU Bound operations
+// ----------------------------------------------------------------------------
 
 /// Decode all five generator sets and build the commitment keys.
 fn decode_generators(body: &[u8]) -> Result<Generators, ApiError> {
@@ -781,8 +770,6 @@ mod tests {
 
     #[test]
     fn malformed_setup_body_is_a_400_not_a_panic() {
-        // `.err()` rather than `unwrap_err()`: Generators holds millions of curve
-        // points in production and deliberately does not implement Debug.
         let e = decode_generators(&[0xff; 16])
             .err()
             .expect("garbage bytes must not decode");

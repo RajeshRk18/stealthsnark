@@ -15,7 +15,7 @@ pub struct DualLPNInstance<F: Field> {
 }
 
 impl<F: Field> DualLPNInstance<F> {
-    /// Sample a fresh Dual-LPN instance:
+    /// Sample a fresh Dual-LPN instance.
     /// 1. Sample sparse e with t nonzero entries across N-dimensional space
     /// 2. Compute r = T * e (dense n-dimensional vector)
     pub fn sample<R: Rng>(t_operator: &TOperator, t: usize, rng: &mut R) -> Self {

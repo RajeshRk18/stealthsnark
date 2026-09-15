@@ -17,7 +17,8 @@ use crate::emsm::malicious::{
     malicious_decrypt, malicious_encrypt, MaliciousDecryptState, MaliciousEncrypted, MaliciousError,
 };
 
-/// Server-aided proving key: wraps the standard Groth16 proving key with
+/// Server-aided proving key.
+/// Wraps the standard Groth16 proving key with
 /// EMSM parameters for each of the 5 MSMs.
 pub struct ServerAidedProvingKey {
     pub pk: ProvingKey<Bn254>,
@@ -176,7 +177,7 @@ pub fn client_encrypt<QAP: R1CSToQAP, C: ConstraintSynthesizer<Fr>, R: Rng>(
     Ok((request, state))
 }
 
-/// Server evaluate: compute 5 MSMs on masked vectors.
+/// compute 5 MSMs on masked vectors.
 pub fn server_evaluate(
     sapk: &ServerAidedProvingKey,
     request: &EncryptedRequest,
@@ -196,7 +197,7 @@ pub fn server_evaluate(
     })
 }
 
-/// Client decrypt: unmask server results and assemble the Groth16 proof.
+/// Unmask server results and assemble the Groth16 proof.
 pub fn client_decrypt(
     sapk: &ServerAidedProvingKey,
     response: &ServerResponse,
@@ -262,11 +263,9 @@ pub fn client_decrypt(
     }
 }
 
-// ─── Malicious-secure variants ───────────────────────────────────────────────
-// These use double-query EMSM (main + check) per MSM so that a cheating server
-// is detected with overwhelming probability.
-
-/// Data sent to the server in malicious mode: 10 masked vectors (5 main + 5 check).
+// --------------------------- Malicious-secure variants -----------------------------------
+// These use double-query EMSM (main + check) per MSM so that a cheating server can be detected 
+/// 10 masked vectors (5 main + 5 check) are sent in malicious mode.
 pub struct MaliciousEncryptedRequest {
     pub h: MaliciousEncrypted<Fr>,
     pub l: MaliciousEncrypted<Fr>,
@@ -288,7 +287,7 @@ pub struct MaliciousClientState {
     pub full_assignment: Vec<Fr>,
 }
 
-/// Server response in malicious mode: 10 MSM results (5 main + 5 check).
+/// Server response in malicious mode(5 main + 5 check).
 pub struct MaliciousServerResponse {
     pub em_h: G1,
     pub em_h_ck: G1,
@@ -302,7 +301,7 @@ pub struct MaliciousServerResponse {
     pub em_b_g2_ck: G2,
 }
 
-/// Malicious-secure client encrypt: double-query per MSM.
+/// Malicious-secure client encrypt
 pub fn malicious_client_encrypt<QAP: R1CSToQAP, C: ConstraintSynthesizer<Fr>, R: Rng>(
     sapk: &ServerAidedProvingKey,
     circuit: C,
@@ -368,7 +367,8 @@ pub fn malicious_client_encrypt<QAP: R1CSToQAP, C: ConstraintSynthesizer<Fr>, R:
     Ok((request, state))
 }
 
-/// Malicious-secure server evaluate: compute 10 MSMs (5 main + 5 check).
+/// Malicious-secure variant server evaluate.
+/// Computes 10 MSMs (5 main + 5 check).
 pub fn malicious_server_evaluate_groth16(
     sapk: &ServerAidedProvingKey,
     request: &MaliciousEncryptedRequest,
@@ -410,7 +410,7 @@ pub fn malicious_server_evaluate_groth16(
     })
 }
 
-/// Malicious-secure client decrypt: verify consistency checks, unmask, assemble proof.
+/// Malicious-secure client decrypt. Performs consistency checks, unmask, and assemble proof.
 /// Returns `MaliciousError::ConsistencyCheckFailed` if the server tampered with any MSM.
 pub fn malicious_client_decrypt(
     sapk: &ServerAidedProvingKey,
@@ -434,7 +434,7 @@ pub fn malicious_client_decrypt(
         &sapk.pre_b_g2,
     )?;
 
-    // Assemble proof (same logic as semi-honest client_decrypt)
+    // Assemble proof (same as semi-honest client_decrypt)
     let num_pub = state.num_instance_variables;
     let public_inputs = &state.full_assignment[1..num_pub];
 
@@ -513,28 +513,22 @@ mod tests {
     fn test_server_aided_groth16_e2e() {
         let mut rng = ChaCha20Rng::seed_from_u64(42);
 
-        // Standard Groth16 setup
         let circuit_for_setup = CubeCircuit::<Fr> { x: None };
         let (pk, vk) = Groth16::<Bn254>::circuit_specific_setup(circuit_for_setup, &mut rng)
             .expect("setup failed");
 
-        // Create server-aided proving key
         let sapk = ServerAidedProvingKey::setup(pk, &mut rng);
 
-        // Client: encrypt (x = 3, so y = 3^3 + 3 + 5 = 35)
         let circuit = CubeCircuit {
             x: Some(Fr::from(3u64)),
         };
         let (request, state) = client_encrypt::<LibsnarkReduction, _, _>(&sapk, circuit, &mut rng)
             .expect("encrypt failed");
 
-        // Server: evaluate 5 MSMs
         let response = server_evaluate(&sapk, &request).expect("server evaluate failed");
 
-        // Client: decrypt and assemble proof
         let proof = client_decrypt(&sapk, &response, &state);
 
-        // Verify the proof
         let public_inputs = vec![Fr::from(35u64)];
         let valid =
             Groth16::<Bn254>::verify(&vk, &public_inputs, &proof).expect("verification failed");

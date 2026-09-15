@@ -1,13 +1,8 @@
 //! Fuzz the full server-side request-parsing pipeline with arbitrary bytes,
-//! mirroring what `handle_setup` / `handle_prove` do before touching any state.
 //!
-//! Invariant: no input can make the parsing path panic — every malformed request
+//! INVARIANT: no input can make the parsing path panic. Every malformed request
 //! or generator/scalar blob must fail gracefully.
-//!
-//! The request envelopes this target used to unwrap are gone: the session id is
-//! no longer carried in the body, because it is now a server-issued bearer token.
-//! A request body is therefore a bare bincode-encoded `SetupRequest` or
-//! `ProveRequest`, which is exactly what is decoded below.
+
 #![no_main]
 
 use ark_bn254::{Fr, G1Affine, G2Affine};

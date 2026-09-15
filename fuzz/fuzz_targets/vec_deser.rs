@@ -1,9 +1,8 @@
-//! Fuzz the wire-deserialization primitives against arbitrary attacker bytes.
+//! Fuzz the deserialization primitives against arbitrary attacker bytes.
 //!
-//! Invariant: deserialization must never panic, never OOM, never hang — only
-//! return `Ok` or `Err`. The `MAX_VEC_LEN` cap is what prevents the length
-//! prefix from driving an unbounded allocation; this target exercises that and
-//! all the arkworks decode paths reachable from the network.
+//! INVARIANT: deserialization must never panic, never OOM, or never hang. should only
+//! return Ok or Err. The `MAX_VEC_LEN` cap in src/protocol/messages.rs is what prevents the length
+//! prefix from driving an unbounded allocation.
 #![no_main]
 
 use ark_bn254::{Fr, G1Affine, G2Affine};

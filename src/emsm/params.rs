@@ -15,7 +15,6 @@ pub struct LpnParams {
 pub fn get_lpn_params(n: usize) -> LpnParams {
     // Table 3 values from the paper for 100-bit security, R=1/4, delta=0.05
     // n -> t (approximate, interpolated for sizes not in table)
-    // For very small n, we clamp t so that N = 4n >= t (needed for error_vec chunking)
     let big_n = 4 * n;
     let raw_t = match n {
         0..=1024 => 29,           // 2^10
@@ -32,11 +31,10 @@ pub fn get_lpn_params(n: usize) -> LpnParams {
         1048577..=2097152 => 99,  // 2^21
         2097153..=4194304 => 108, // 2^22
         4194305..=8388608 => 118, // 2^23
-        _ => 128,                 // 2^24+
+        _ => 128,                 // 2^24 and above
     };
 
-    // Clamp t so that the expanded vector size N = 4n >= t
-    // (for tiny circuits, security is naturally limited by the small dimension)
+    // For very small n, we clamp t so that N = 4n >= t 
     let t = raw_t.min(big_n.max(1));
     LpnParams { n, big_n, t }
 }

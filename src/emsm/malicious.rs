@@ -14,7 +14,7 @@ pub enum MaliciousError {
 }
 
 /// Encrypted data for the malicious-secure variant.
-/// Contains two masked vectors: one for the actual computation and one for the check.
+/// Both are sent are queries. Each has independent LPN noise.
 pub struct MaliciousEncrypted<F: PrimeField> {
     /// v = z + r (masked witness)
     pub masked: Vec<F>,
@@ -33,7 +33,6 @@ pub struct MaliciousDecryptState<F: PrimeField> {
 }
 
 /// Encrypt for malicious-secure EMSM.
-/// Sends two queries: v = z + r and v_ck = c*z + r' with independent LPN noise.
 pub fn malicious_encrypt<G: CurveGroup, R: Rng>(
     params: &EmsmPublicParams<G>,
     witness: &[G::ScalarField],
@@ -76,7 +75,7 @@ pub fn malicious_server_evaluate<G: CurveGroup>(
     Ok((em, em_ck))
 }
 
-/// Decrypt and verify consistency: dm_ck should equal c * dm.
+/// Decrypt and verify consistency.
 /// If the server cheated on either query, the check fails with overwhelming probability.
 pub fn malicious_decrypt<G: CurveGroup>(
     server_result: G,

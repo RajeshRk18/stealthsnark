@@ -1,5 +1,4 @@
-//! Demo client: proves a Circom `multiplier2` circuit through the server-aided
-//! Groth16 protocol and verifies the resulting proof locally.
+//! A demo client to run full proof pipeline
 
 use ark_bn254::{Bn254, G1Affine, G2Affine};
 use ark_circom::CircomReduction;
@@ -27,16 +26,12 @@ async fn main() -> anyhow::Result<()> {
     println!("=== StealthSnark Client (Circom multiplier2) ===");
     println!("Server: {server_url}");
 
-    // Step 1: Groth16 setup with Circom circuit
     println!("[1/6] Running Groth16 trusted setup (Circom multiplier2)...");
     let (pk, vk) = circom_setup(MULTIPLIER2_WASM, MULTIPLIER2_R1CS, &mut rng)?;
 
-    // Step 2: Create server-aided proving key (EMSM preprocessing)
     println!("[2/6] Creating server-aided proving key (EMSM preprocessing)...");
     let sapk = ServerAidedProvingKey::setup(pk, &mut rng);
 
-    // Step 3: Send generators to server. The session token comes back from the
-    // server; the client does not pick its own identifier.
     println!("[3/6] Sending generators to server...");
     let mut http_client = build_client(&server_url)?;
     let setup_request = SetupRequest::encode::<G1Affine, G2Affine>(
@@ -52,7 +47,6 @@ async fn main() -> anyhow::Result<()> {
         http_client.session_label().unwrap_or("?")
     );
 
-    // Step 4: Build Circom circuit and encrypt
     println!("[4/6] Building Circom circuit (a=3, b=11) and encrypting...");
     let circuit = build_circuit(
         MULTIPLIER2_WASM,
@@ -62,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
     let public_inputs = get_public_inputs(&circuit).expect("no public inputs");
     let (request, state) = client_encrypt::<CircomReduction, _, _>(&sapk, circuit, &mut rng)?;
 
-    // Step 5: Send masked vectors to server, receive MSM results
+    // Send masked vectors to server
     println!("[5/6] Delegating MSM computation to server...");
     let prove_request = ProveRequest::encode(
         &request.v_h,
@@ -82,14 +76,13 @@ async fn main() -> anyhow::Result<()> {
         em_b_g2: ark_from_bytes::<G2Affine>(&prove_response.em_b_g2)?.into(),
     };
 
-    // Step 6: Decrypt and verify
+    // Decrypt and verify
     println!("[6/6] Decrypting proof and verifying...");
     let proof = client_decrypt(&sapk, &server_response, &state);
     let valid = Groth16::<Bn254, CircomReduction>::verify(&vk, &public_inputs, &proof)?;
 
     // Free the server's copy of the generators rather than leaving them pinned
-    // until the idle TTL expires. Best-effort: a failure here does not
-    // invalidate a proof we already verified.
+    // until the idle TTL expires.
     if let Err(e) = http_client.release().await {
         tracing::warn!(error = %e, "failed to release session; it will expire on its own");
     }
@@ -98,7 +91,6 @@ async fn main() -> anyhow::Result<()> {
         println!("SUCCESS: Server-aided Groth16 proof verified! (3 * 11 = 33)");
         Ok(())
     } else {
-        // Exit non-zero so a scripted caller notices.
         anyhow::bail!("proof verification failed")
     }
 }
@@ -118,7 +110,7 @@ fn build_client(server_url: &str) -> anyhow::Result<EmsmClient> {
         println!("      trusting CA from {path}");
     }
 
-    // mTLS: certificate and key in one PEM file. Checked before the API key,
+    // mTLS certificate and key in one PEM file. Checked before the API key,
     // because a certificate identifies the connection itself.
     if let Ok(path) = std::env::var("STEALTHSNARK_CLIENT_IDENTITY") {
         builder = builder.client_identity_file(&path)?;

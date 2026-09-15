@@ -1,27 +1,16 @@
 //! Client authentication and the tier model.
 //!
-//! # Two-layer credential model
 //!
-//! A request carries up to two independent credentials:
+//! A request carries two credentials used in different stage:
 //!
-//! 1. A **client credential** that says *who you are* — an API key, or a TLS
-//!    client certificate under mTLS. It is required on every `/v1` endpoint.
-//! 2. A **session token** that says *which stored generators you mean*. It is
-//!    issued by `/v1/setup` and required on `/v1/prove` and `/v1/session`.
+//!     - API Key or TLS client certificate which is helpful to identify "who am i"
+//!     - Session token to identify the short lived session owned by that identity bearer(server identifies the user's generators sent via `/v1/setup`)
 //!
 //! The layers are deliberately separate. A session records the principal that
 //! created it, so a stolen session token is useless without that principal's
 //! client credential, and one principal can never operate on another's session
-//! even if it learns the token. A single combined credential could not express
-//! either property.
-//!
-//! # API key format
-//!
-//! `ssk_<key_id>_<secret>`, where `key_id` is 16 hex characters and `secret` is
-//! 64. The key id makes lookup a single map probe instead of a scan over every
-//! record, which matters because a scan would compare the secret against each
-//! stored digest in turn. Only `SHA-256(secret)` is stored, so the auth file
-//! never holds a usable credential.
+//! even if it learns the token. 
+
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -45,8 +34,7 @@ pub enum AuthMode {
     ///
     /// This must be selected explicitly, and
     /// [`crate::protocol::config::ServerConfig::validate`] refuses it on a
-    /// non-loopback bind address. An unauthenticated service reachable from a
-    /// network is almost never the intent.
+    /// non-loopback bind address. An unauthenticated service should not be reachable from a network
     Disabled,
     /// API key only.
     ApiKey,
@@ -71,9 +59,6 @@ impl AuthMode {
     }
 
     /// Whether the TLS layer must demand a certificate from the client.
-    ///
-    /// `Any` requests one but tolerates its absence, because such a caller may
-    /// instead present an API key.
     pub fn requires_client_cert(self) -> bool {
         matches!(self, Self::MutualTls)
     }
@@ -98,7 +83,7 @@ impl std::str::FromStr for AuthMode {
 /// Resource limits attached to a principal.
 ///
 /// Quota lives on the tier rather than on the principal so that limits are
-/// declared once and shared, which is how a plan behaves in practice.
+/// declared once and shared.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tier {
     pub name: String,
@@ -151,7 +136,7 @@ impl Tier {
 pub enum AuthMethod {
     ApiKey,
     MutualTls,
-    /// Authentication is disabled. Never produced when [`AuthMode::is_enabled`].
+    /// Authentication is disabled.
     Anonymous,
 }
 
@@ -168,7 +153,7 @@ impl AuthMethod {
 /// An authenticated caller.
 #[derive(Clone, Debug)]
 pub struct Principal {
-    /// Stable, non-secret identifier. Safe to log and to use as a metric label.
+    /// Non-secret identifier. Safe to log and to use as a metric label.
     pub id: String,
     pub tier: Tier,
     pub method: AuthMethod,
@@ -189,11 +174,10 @@ impl Principal {
 struct Record {
     principal_id: String,
     tier: String,
-    /// Hex SHA-256 of the API key secret.
     api_key_sha256: Option<String>,
 }
 
-/// Credential store: API keys by key id, principals by client-certificate digest.
+/// Credential store
 #[derive(Debug)]
 pub struct AuthStore {
     mode: AuthMode,
@@ -254,6 +238,7 @@ impl AuthStore {
         let mut tiers: HashMap<String, Tier> = HashMap::new();
         tiers.insert("default".to_string(), Tier::default_tier());
 
+        // validating tier specs
         for (name, t) in spec.tiers {
             if t.requests_per_sec <= 0.0 || !t.requests_per_sec.is_finite() {
                 anyhow::bail!("tier {name:?}: requests_per_sec must be a positive number");
@@ -337,7 +322,7 @@ impl AuthStore {
 
     /// Resolve a caller to a principal.
     ///
-    /// `presented_key` is the `Authorization: Bearer` value; `cert_digest` is the
+    /// `presented_key` is the `Authorization: Bearer` value, `cert_digest` is the
     /// hex SHA-256 of the peer certificate, when the connection supplied one.
     pub fn authenticate(
         &self,

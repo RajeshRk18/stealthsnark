@@ -1,13 +1,12 @@
 [package]
 name = "stealthsnark-fuzz"
-version = "0.0.0"
+version = "0.0.1"
 publish = false
 edition = "2021"
 
 [package.metadata]
 cargo-fuzz = true
 
-# Isolate the fuzz crate from the parent package (it is not a workspace member).
 [workspace]
 
 [dependencies]
@@ -21,10 +20,7 @@ ark-ec = "0.5"
 ark-ff = "0.5"
 ark-groth16 = "0.5"
 ark-snark = "0.5"
-
-[dependencies.stealthsnark]
-path = ".."
-default-features = false  # exclude circom/wasmer (does not build under the fuzz sanitizer)
+stealthsnark = { path = "..", default-features = false }
 
 # cargo-fuzz needs debug info in release for symbolized crash reports.
 [profile.release]

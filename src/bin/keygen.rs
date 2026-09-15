@@ -49,15 +49,13 @@ fn main() {
         i += 1;
     }
 
-    // Optional: register a TLS client certificate for the same principal, so one
-    // command can produce a record usable under either auth mode.
     let cert_digest = cert_path
         .as_deref()
         .map(|path| cert_digest_of(path).unwrap_or_else(|e| fail(&format!("{e}"))));
 
     let generated = generate_api_key();
 
-    println!("API key (shown once, store it now — the server keeps only its digest):");
+    println!("API key (shown once, store it now !):");
     println!();
     println!("  {}", generated.key);
     println!();

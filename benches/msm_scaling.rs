@@ -1,14 +1,4 @@
 //! Performance regression benchmarks.
-//!
-//! Two things worth watching over time:
-//!   * the EMSM primitive (encrypt / server MSM / decrypt) should scale ~linearly
-//!     in the vector length — a superlinear regression would signal an accidental
-//!     O(n^2) in the RAA-code path;
-//!   * end-to-end server-aided proving should stay dominated by the server MSM,
-//!     not by client-side masking.
-//!
-//! Run with `cargo bench`. These are not assertions; criterion tracks deltas
-//! across runs in target/criterion and flags regressions.
 
 use ark_bn254::{Bn254, Fr, G1Projective as G1};
 use ark_ec::CurveGroup;

@@ -6,12 +6,12 @@ use super::params::get_lpn_params;
 use super::pedersen::Pedersen;
 use super::raa_code::TOperator;
 
-/// Public parameters for EMSM, created from generators (proving key elements).
+/// Public parameters for EMSM
 #[derive(Clone, Debug)]
 pub struct EmsmPublicParams<G: CurveGroup> {
-    /// The TOperator (RAA code) for masking
+    /// The TOperator for masking
     pub t_operator: TOperator,
-    /// Original generators (affine points)
+    /// Original generators 
     pub generators: Vec<G::Affine>,
     /// LPN sparsity parameter
     pub t: usize,
@@ -25,13 +25,12 @@ pub struct PreprocessedCommitments<G: CurveGroup> {
     /// h[i] = sum over j of G^T[i][j] * generators[j]
     /// Stored as projective points for efficient sparse MSM later.
     pub h: Vec<G>,
-    /// Pedersen instance over preprocessed generators (for sparse MSM during decryption)
+    /// Pedersen instance over preprocessed generators
     pub pedersen_h: Pedersen<G>,
 }
 
 impl<G: CurveGroup> EmsmPublicParams<G> {
     /// Create EMSM public parameters from generators.
-    /// `generators` are the proving key elements (e.g., h_query, l_query points).
     pub fn new<R: Rng>(generators: Vec<G::Affine>, rng: &mut R) -> Self {
         let n = generators.len();
         let params = get_lpn_params(n);
@@ -43,22 +42,21 @@ impl<G: CurveGroup> EmsmPublicParams<G> {
         }
     }
 
-    /// Preprocess: compute h = G^T * g (expand generators through transpose of RAA code).
+    /// Compute G^T * g (expand generators through transpose of RAA code).
     /// h has dimension N = 4n. Used by client to remove noise during decryption.
     pub fn preprocess(&self) -> PreprocessedCommitments<G> {
         let h: Vec<G> = self
             .t_operator
             .multiply_transpose_group::<G>(&self.generators);
 
-        // Convert to affine for Pedersen
         let h_affine: Vec<G::Affine> = h.iter().map(|p| p.into_affine()).collect();
         let pedersen_h = Pedersen::from_generators(h_affine);
 
         PreprocessedCommitments { h, pedersen_h }
     }
 
-    /// Server-side computation: MSM(masked_scalars, generators).
-    /// The server just does a plain MSM on the masked vector — it doesn't know the mask.
+    /// Computes MSM(masked_scalars, generators).
+    /// From server side, it is just a plain MSM on the masked vector.
     pub fn server_computation(
         &self,
         masked_scalars: &[G::ScalarField],
@@ -68,7 +66,7 @@ impl<G: CurveGroup> EmsmPublicParams<G> {
     }
 }
 
-/// Encrypt (mask) a witness vector and return the masked vector + decryption material.
+/// Encrypt(mask) a witness vector and return the masked vector + decryption material.
 pub fn encrypt<G: CurveGroup, R: Rng>(
     params: &EmsmPublicParams<G>,
     witness: &[G::ScalarField],
@@ -79,9 +77,8 @@ pub fn encrypt<G: CurveGroup, R: Rng>(
     (masked, lpn)
 }
 
-/// Decrypt: remove noise contribution from server's MSM result.
-/// result = server_msm - <e, h>
-/// where e is the sparse noise and h = G^T * g (preprocessed commitments).
+/// Decrypt(unmask) the server's MSM result.
+/// removes noise contribution.
 pub fn decrypt<G: CurveGroup>(
     server_result: G,
     lpn: &DualLPNInstance<G::ScalarField>,

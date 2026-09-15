@@ -1,11 +1,5 @@
 //! Per-principal quota: request rate, body size, and concurrent sessions.
 //!
-//! The server-wide limits in [`crate::protocol::config`] protect the process.
-//! They cannot stop one caller from consuming everything, because they do not
-//! know who is calling. These limits are per principal, so one noisy client
-//! degrades only itself.
-//!
-//! Three limits, each stopping a different failure:
 //!
 //! - **Request rate** — a token bucket. Absorbs a legitimate burst, then holds
 //!   the caller to a sustained rate.
@@ -100,7 +94,7 @@ impl QuotaEnforcer {
 
     /// Reject an upload larger than the principal's tier allows.
     ///
-    /// A missing `Content-Length` is permitted here; the transport body limit is
+    /// A missing `Content-Length` is permitted here because the transport body limit is
     /// the backstop for a chunked or lying sender.
     pub fn check_body_size(
         &self,
@@ -109,10 +103,7 @@ impl QuotaEnforcer {
     ) -> Result<(), ApiError> {
         let limit = principal.tier.max_body_bytes as u64;
         match content_length {
-            Some(len) if len > limit => Err(ApiError::BodyTooLarge {
-                limit_bytes: limit,
-                got_bytes: len,
-            }),
+            Some(len) if len > limit => Err(ApiError::BodyTooLarge { limit_bytes: limit }),
             _ => Ok(()),
         }
     }

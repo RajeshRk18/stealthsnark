@@ -1,7 +1,6 @@
 use ark_ff::Field;
 use ark_std::rand::Rng;
-// Rayon (and the threshold that switches to it) is only used in the parallel
-// branches, which are gated out under `cargo kani` — see `accumulate_inplace`.
+
 #[cfg(not(kani))]
 use rayon::prelude::*;
 
@@ -12,13 +11,13 @@ const PARALLEL_THRESHOLD: usize = 1 << 16;
 /// need: an identity, in-place addition, and an identity test. Decoupling the
 /// kernels from the full `Field` trait lets the Kani proofs (see the `kani_proofs`
 /// module) instantiate them with a tiny, model-checkable type instead of 254-bit
-/// BN254 arithmetic — while production still runs the *same* kernels on real
+/// BN254 arithmetic while production still runs the *same* kernels on real
 /// field elements via the blanket impl below.
 ///
 /// Every operation here is that of a commutative monoid (associative,
 /// commutative `+` with identity `0`), so any reordering identity proved for one
 /// such type (e.g. wrapping `u64` = ℤ/2⁶⁴) holds for every field too. That is
-/// what makes the Kani results transfer to the real code.
+/// what makes the Kani results transfer to the production kernels.
 pub(crate) trait Additive: Copy + Send + Sync {
     fn azero() -> Self;
     fn aadd_assign(&mut self, rhs: &Self);
@@ -40,10 +39,8 @@ impl<F: Field> Additive for F {
     }
 }
 
-/// Phase-1 kernel (also the whole sequential path): rewrite `chunk` in place
-/// with its suffix sums — `chunk[i] = Σ chunk[i..]` — and return the chunk
-/// total. Shared verbatim by `accumulate_inplace` and the Kani model, so the
-/// logic Kani proves IS the logic production runs.
+/// Phase-1 kernel: rewrite `chunk` in place with its suffix sums — `chunk[i] = Σ chunk[i..]`
+/// and return the chunk total.
 #[inline]
 pub(crate) fn chunk_suffix_sum_inplace<T: Additive>(chunk: &mut [T]) -> T {
     let mut sum = T::azero();
@@ -51,13 +48,12 @@ pub(crate) fn chunk_suffix_sum_inplace<T: Additive>(chunk: &mut [T]) -> T {
         sum.aadd_assign(elem);
         *elem = sum;
     }
+
     sum
 }
 
 /// Phase-2 kernel: exclusive suffix sums of the per-chunk totals.
-/// `corrections[i] = Σ chunk_sums[i+1..]`, with `corrections[last] = 0`. This is
-/// the off-by-one-prone step that previously harboured dead code; it is proved
-/// against its specification directly in `kani_proofs::exclusive_suffix_sums_correct`.
+/// `corrections[i] = Σ chunk_sums[i+1..]` with `corrections[last] = 0`.
 #[inline]
 pub(crate) fn exclusive_suffix_sums<T: Additive>(chunk_sums: &[T]) -> Vec<T> {
     let num = chunk_sums.len();
@@ -70,8 +66,7 @@ pub(crate) fn exclusive_suffix_sums<T: Additive>(chunk_sums: &[T]) -> Vec<T> {
     corrections
 }
 
-/// Fold kernel: sum one group of four, `Σ v[4i..4i+4]`. Shared by both branches
-/// of `apply_f_fold` and proved in `kani_proofs::fold_quad_correct`.
+/// Fold kernel: sum one group of four, `Σ v[4i..4i+4]`.
 #[inline]
 pub(crate) fn fold_quad<T: Additive>(v: &[T], i: usize) -> T {
     let mut acc = v[4 * i];
@@ -83,7 +78,7 @@ pub(crate) fn fold_quad<T: Additive>(v: &[T], i: usize) -> T {
 
 /// TOperator implements the RAA (Random Accumulate and Add) code.
 /// G = F_r * M_p * A * M_q * A
-/// where A = accumulate (suffix-sum), M_p/M_q = permute, F_r = fold (4:1).
+/// where A = accumulate (suffix-sum), M_p = permute by p, M_q = permute by q, F_r = 4:1 fold.
 ///
 /// Maps N-dimensional sparse vectors to n-dimensional dense vectors,
 /// where N = 4n (rate R = 1/4).
@@ -121,7 +116,7 @@ impl TOperator {
         }
     }
 
-    /// Multiply a sparse vector by the TOperator: G * e.
+    /// Multiply a sparse vector by the TOperator.
     /// Computes F_r * M_p * A * M_q * A * e in O(N) additions.
     pub fn multiply_sparse<F: Field>(&self, sparse_entries: &[(usize, F)]) -> Vec<F> {
         // Start with dense representation of sparse input
@@ -130,19 +125,14 @@ impl TOperator {
             v[i] += *val;
         }
 
-        // Step 1: A (accumulate / suffix-sum)
         accumulate_inplace(&mut v);
 
-        // Step 2: M_q (permute by q)
         v = permute_safe(&v, &self.perm_q);
 
-        // Step 3: A (accumulate again)
         accumulate_inplace(&mut v);
 
-        // Step 4: M_p (permute by p)
         v = permute_safe(&v, &self.perm_p);
 
-        // Step 5: F_r (fold: sum groups of 4 to go from N -> n)
         apply_f_fold(&v)
     }
 
@@ -178,30 +168,23 @@ impl TOperator {
 }
 
 /// Compute suffix-sum in-place: v[i] = sum(v[i..N]).
-///
-/// Both branches are built from `chunk_suffix_sum_inplace` and
-/// `exclusive_suffix_sums`; the parallel branch only changes the *execution
-/// order* of independent per-chunk work (rayon), which is irrelevant to the
-/// result. The kernels' correctness — including their equivalence under
-/// chunking — is machine-checked in `kani_proofs`.
 fn accumulate_inplace<T: Additive>(v: &mut [T]) {
     let n = v.len();
     if n <= 1 {
         return;
     }
 
-    // The rayon branch is gated out under `cargo kani`: monomorphising rayon's
-    // worker-thread machinery balloons the CBMC model even though the branch is
-    // unreachable at the proof's small sizes. Its *logic* is verified rayon-free
-    // by `kani_proofs::chunked_suffix_sum_equals_naive` (a faithful sequential
-    // mirror). Production keeps both branches.
+    // The rayon branch is gated out under `cargo kani` because rayon's
+    // worker thread machinery makes the CBMC model much larger and slower monomorphising rayon's
+    // worker-thread machinery balloons the CBMC model so only the logic is verified 
+    // here: `kani_proofs::chunked_suffix_sum_equals_naive`
     #[cfg(not(kani))]
     if n >= PARALLEL_THRESHOLD {
         // Parallel: chunk-wise suffix sums, then fix up with chunk corrections.
         let num_chunks = rayon::current_num_threads().min(n / 1024).max(1);
         let chunk_size = n.div_ceil(num_chunks);
 
-        // Phase 1: local suffix sums within each chunk; collect chunk totals.
+        // Phase 1: local suffix sums within each chunk
         let chunk_sums: Vec<T> = v
             .par_chunks_mut(chunk_size)
             .map(chunk_suffix_sum_inplace)
@@ -224,16 +207,15 @@ fn accumulate_inplace<T: Additive>(v: &mut [T]) {
         return;
     }
 
-    // Sequential suffix-sum is exactly the single-chunk case of phase 1.
+    // Sequential suffix-sum is exactly the single-chunk case of phase 1
     chunk_suffix_sum_inplace(v);
 }
 
 /// Apply permutation: out[i] = v[perm[i]]
 fn permute_safe<F: Clone + Send + Sync>(v: &[F], perm: &[usize]) -> Vec<F> {
     assert_eq!(v.len(), perm.len());
-    // Rayon branch gated out under Kani (see `accumulate_inplace`); both branches
-    // apply the identical `v[perm[i]]` indexing, so the sequential proof covers
-    // the panic-safety of both.
+
+    // see `accumulate_in_place` to know why I have this gate
     #[cfg(not(kani))]
     if v.len() >= PARALLEL_THRESHOLD {
         return perm.par_iter().map(|&p| v[p].clone()).collect();
@@ -255,15 +237,10 @@ fn prefix_sum_inplace_group<G: ark_ec::CurveGroup>(v: &mut [G]) {
 }
 
 /// Fold: sum groups of 4 to reduce from N=4n to n.
-///
-/// Both branches share the `fold_quad` kernel (proved in
-/// `kani_proofs::fold_quad_correct`); the parallel branch only distributes the
-/// independent per-group sums across threads.
 fn apply_f_fold<T: Additive>(v: &[T]) -> Vec<T> {
     assert!(v.len().is_multiple_of(4));
     let n = v.len() / 4;
-    // Rayon branch gated out under Kani (see `accumulate_inplace`); both branches
-    // map the identical `fold_quad` kernel.
+
     #[cfg(not(kani))]
     if n >= PARALLEL_THRESHOLD / 4 {
         return (0..n).into_par_iter().map(|i| fold_quad(v, i)).collect();
@@ -271,7 +248,7 @@ fn apply_f_fold<T: Additive>(v: &[T]) -> Vec<T> {
     (0..n).map(|i| fold_quad(v, i)).collect()
 }
 
-/// Compute inverse of a permutation.
+/// Compute inverse of a permutation. Assumes every value is unique and less than `perm.len()`
 pub fn inverse_permutation(perm: &[usize]) -> Vec<usize> {
     let mut inv = vec![0; perm.len()];
     for (i, &p) in perm.iter().enumerate() {
@@ -280,7 +257,7 @@ pub fn inverse_permutation(perm: &[usize]) -> Vec<usize> {
     inv
 }
 
-/// Generate a random permutation using Fisher-Yates.
+/// Generate a random permutation using Fisher-Yates(https://en.wikipedia.org/wiki/Fisher%E2%80%93Yates_shuffle)
 fn random_permutation<R: Rng>(n: usize, rng: &mut R) -> Vec<usize> {
     let mut perm: Vec<usize> = (0..n).collect();
     for i in (1..n).rev() {
@@ -290,26 +267,18 @@ fn random_permutation<R: Rng>(n: usize, rng: &mut R) -> Vec<usize> {
     perm
 }
 
-/// Bounded formal proofs (run with `cargo kani`). These verify the RAA scalar
-/// kernels — the suffix-sum chunking and fold logic that mutation testing
-/// flagged as subtle — over *all* inputs up to a small bound, complementing the
-/// sampled-size `tests` below which only check specific large inputs.
+/// These proofs the RAA scalar kernels such as suffix-sum chunking 
+/// and fold logic over *all* inputs up to a small bound.
 ///
-/// The kernels are generic over [`Additive`]; here they are instantiated with a
-/// tiny commutative monoid (`Toy` = wrapping `u64` = ℤ/2⁶⁴) that Kani can reason
-/// about symbolically. Because the kernels rely only on the monoid laws
-/// (associativity, commutativity, identity), every identity proved for `Toy`
-/// holds for BN254's scalar field too — the proofs verify the *exact* production
-/// kernels, just at a model-checkable element type. The parallel branches reduce
-/// to these same kernels under rayon, whose only effect is execution order of
-/// independent per-chunk work — irrelevant to the (order-independent) result.
+/// The kernels are generic over [`Additive`]. They are instantiated with a
+/// tiny commutative monoid `Toy`(wrapping `u64`) that Kani can reason
+/// about symbolically. Kernels rely only on the monoid laws
+/// (associativity, commutativity, identity), so every identity proved for `Toy`
+/// holds for BN254's scalar field too.
 #[cfg(kani)]
 mod kani_proofs {
     use super::*;
 
-    /// Model element: the commutative monoid ℤ/2⁶⁴ (wrapping `u64`). Wrapping
-    /// addition keeps the operation total (no overflow panic) and associative +
-    /// commutative, exactly the structure the kernels assume of a field's `+`.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     struct Toy(u64);
 
@@ -331,9 +300,7 @@ mod kani_proofs {
         }
     }
 
-    /// Independent specification of a suffix sum: `out[i] = Σ v[i..]`. Written as
-    /// plainly as possible so it is obviously correct by inspection — it is the
-    /// oracle the chunked algorithm is checked against.
+    /// Naive implementation of suffix sum.
     fn naive_suffix(v: &[Toy]) -> Vec<Toy> {
         let n = v.len();
         let mut out = vec![Toy(0); n];
@@ -345,9 +312,7 @@ mod kani_proofs {
         out
     }
 
-    /// Sequential mirror of `accumulate_inplace`'s *parallel* branch: identical
-    /// code, with `chunks_mut`/`for` standing in for `par_chunks_mut`/`for_each`.
-    /// Verifying this verifies the parallel branch's logic for any chunking.
+    /// Naive `accumulate_inplace` implementation
     fn chunked_model(v: &mut [Toy], chunk_size: usize) {
         let chunk_sums: Vec<Toy> = v
             .chunks_mut(chunk_size)
@@ -364,8 +329,7 @@ mod kani_proofs {
         }
     }
 
-    /// Phase 2 is the off-by-one-prone step that once hid dead code. Prove it
-    /// meets its spec exactly: `corr[i] = Σ chunk_sums[i+1..]`, `corr[last] = 0`.
+    /// Proves `corr[i] = Σ chunk_sums[i+1..]`, `corr[last] = 0`.
     #[kani::proof]
     #[kani::unwind(7)]
     fn exclusive_suffix_sums_matches_spec() {
@@ -382,16 +346,7 @@ mod kani_proofs {
         }
     }
 
-    /// The whole chunked suffix-sum (the parallel branch's logic) equals the
-    /// naive suffix sum, for every input. This is the property the dead-code bug
-    /// could have broken.
-    ///
-    /// `CS` is the chunk size. It is a const generic (not a symbolic value) on
-    /// purpose: a symbolic stride makes `chunks_mut`'s pointer arithmetic
-    /// pathological for CBMC, while enumerating every concrete `CS` in `1..=N`
-    /// covers *all* possible chunkings of an `N`-element slice — exhaustively
-    /// equivalent to a symbolic chunk size, but fast. `CS >= N` is the
-    /// single-chunk (sequential) case.
+    /// Chunked suffix-sum equals the naive suffix sum
     fn chunked_equals_naive<const N: usize, const CS: usize>() {
         let a: [Toy; N] = kani::any();
         let expected = naive_suffix(&a);
@@ -424,8 +379,7 @@ mod kani_proofs {
         chunked_equals_naive::<4, 4>();
     }
 
-    /// The production entry point on its sequential branch (n < threshold) also
-    /// equals the naive reference.
+    /// `accumulate_in_place` equals the naive reference implementation.
     #[kani::proof]
     #[kani::unwind(6)]
     fn accumulate_inplace_sequential_equals_naive() {
@@ -439,7 +393,7 @@ mod kani_proofs {
         }
     }
 
-    /// Fold reduces 4n→n with `out[i] = Σ v[4i..4i+4]`, and the index arithmetic
+    /// Fold reduces 4n -> n with `out[i] = Σ v[4i..4i+4]`, and the index arithmetic
     /// `4i+k` never goes out of bounds for multiple-of-4 input.
     #[kani::proof]
     #[kani::unwind(10)] // N=8 symbolic array => Arbitrary fills via an 8-iteration loop
@@ -458,8 +412,7 @@ mod kani_proofs {
     }
 
     /// `permute_safe` with in-range indices never panics and yields
-    /// `out[i] = v[perm[i]]`. (In production the indices come from a real
-    /// permutation, so they are always in range — that is the precondition.)
+    /// `out[i] = v[perm[i]]`. I think we probably dont need this checker.
     #[kani::proof]
     #[kani::unwind(6)]
     fn permute_safe_in_bounds_is_correct() {
@@ -477,13 +430,12 @@ mod kani_proofs {
     }
 
     /// For any valid permutation, `inverse_permutation` produces its true
-    /// inverse (both `inv[perm[i]] = i` and `perm[inv[j]] = j`) and never panics.
+    /// inverse (both `inv[perm[i]] = i` and `perm[inv[j]] = j`).
     #[kani::proof]
     #[kani::unwind(6)]
     fn inverse_permutation_inverts_valid_permutation() {
         const N: usize = 4;
         let perm: [usize; N] = kani::any();
-        // A valid permutation: in range and pairwise distinct (=> a bijection).
         for i in 0..N {
             kani::assume(perm[i] < N);
         }

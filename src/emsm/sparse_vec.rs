@@ -1,7 +1,8 @@
 use ark_ff::Field;
 use ark_std::rand::Rng;
 
-/// Sparse vector: stores (index, value) pairs over a field F.
+/// Sparse vector
+/// stores (index, value) pairs over a field F.
 #[derive(Clone, Debug)]
 pub struct SparseVector<F: Field> {
     pub size: usize,
@@ -10,6 +11,7 @@ pub struct SparseVector<F: Field> {
 
 impl<F: Field> SparseVector<F> {
     pub fn new(size: usize, entries: Vec<(usize, F)>) -> Self {
+        // bound check
         debug_assert!(entries.iter().all(|(i, _)| *i < size));
         Self { size, entries }
     }

@@ -103,21 +103,14 @@ impl Generators {
 pub struct Session {
     /// Short, non-secret identifier for logs and metrics.
     ///
-    /// The token is a bearer credential, so it must never reach a log sink; this
-    /// label exists so that requests remain traceable without leaking it.
+    /// The token is a bearer credential, so it must never be logged. 
+    /// This label exists so that requests remain traceable without leaking it.
     pub label: String,
     /// Id of the principal that created this session.
-    ///
-    /// This is what makes the session token second-factor rather than sufficient:
-    /// [`SessionStore::get_owned`] refuses a token presented by any other
-    /// principal, so a leaked token is useless without the owner's credential.
     pub owner: String,
     pub generators: Generators,
     pub resident_bytes: usize,
     /// Milliseconds since the store's epoch when this session was created.
-    ///
-    /// Fixed for the life of the session, so it bounds the total lifetime of the
-    /// token. `last_seen_ms` alone cannot: every use resets it.
     created_ms: u64,
     /// Milliseconds since the store's epoch at last successful lookup.
     last_seen_ms: AtomicU64,
@@ -129,11 +122,7 @@ impl Session {
     }
 }
 
-/// Hand-written to print a summary.
-///
-/// A derived implementation would dump every generator — millions of curve points
-/// for a real circuit — which turns one stray `{:?}` into an unusable log and a
-/// memory spike. Counts carry all the diagnostic value.
+/// Custom debug implementation to avoid logging generator points. 
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session")
@@ -145,7 +134,6 @@ impl std::fmt::Debug for Session {
     }
 }
 
-/// Why a session ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExpiryReason {
     /// Unused for longer than the idle timeout.
@@ -154,7 +142,6 @@ enum ExpiryReason {
     MaxAge,
 }
 
-/// What one sweep reclaimed, split by reason.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SweepOutcome {
     pub idle: usize,
@@ -167,7 +154,7 @@ impl SweepOutcome {
     }
 }
 
-/// Token-keyed session map with an idle TTL, an absolute age cap, and a hard
+/// SessionStore stores a session map with an idle TTL, an absolute age cap, and a hard
 /// capacity cap.
 pub struct SessionStore {
     inner: RwLock<HashMap<String, Arc<Session>>>,
@@ -199,10 +186,6 @@ impl SessionStore {
     }
 
     /// Store generators and return `(token, label)`.
-    ///
-    /// The token is freshly minted from the OS CSPRNG; the client has no say in
-    /// it. Expired sessions are swept first so that a full map caused purely by
-    /// abandoned sessions does not reject a legitimate new one.
     pub fn insert(
         &self,
         owner: &str,
@@ -232,18 +215,13 @@ impl SessionStore {
         Ok((token, label))
     }
 
-    /// Look up a session by token, refreshing its idle timer.
-    ///
-    /// A `HashMap` probe is not constant-time, so this technically leaks timing
-    /// information about the key. With 256 bits of entropy an attacker has
-    /// nothing to walk toward, so the simplicity is worth more than a
-    /// constant-time map here. Revisit if tokens ever become shorter or derived.
+    /// Look up a session by token,
     pub fn get(&self, token: &str) -> Option<Arc<Session>> {
         let now = self.now_ms();
         let map = self.read();
         let session = map.get(token)?;
         if self.is_expired(session, now) {
-            // Leave removal to the sweeper; treating it as absent is enough here
+            // Sweeper handles the removal. Treating it as absent is enough here
             // and keeps this path on a read lock.
             return None;
         }
@@ -391,10 +369,6 @@ impl SessionStore {
         None
     }
 
-    // A panic while holding this lock cannot leave the map structurally invalid —
-    // the only operations performed are insert/remove/retain on owned values — so
-    // recovering the guard is preferable to letting one poisoned lock take every
-    // subsequent request down with it.
     fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Arc<Session>>> {
         self.inner.read().unwrap_or_else(|e| e.into_inner())
     }

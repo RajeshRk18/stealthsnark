@@ -23,7 +23,7 @@ use super::auth::AuthMode;
 pub struct TlsPaths {
     /// Server certificate chain, leaf first.
     pub cert: PathBuf,
-    /// Server private key: PKCS#8, PKCS#1, or SEC1.
+    /// Server private key(PKCS#8, PKCS#1, or SEC1).
     pub key: PathBuf,
     /// CA that signs client certificates. Required for mTLS.
     pub client_ca: Option<PathBuf>,
@@ -31,18 +31,15 @@ pub struct TlsPaths {
 
 /// Default cap on a single request body.
 ///
-/// This is the setting that decides which circuits the service can actually
-/// serve. `/setup` uploads every generator for all five MSMs in one body: a
-/// compressed G1 point is 32 bytes and a G2 point 64, so a circuit needing 2^20
+/// Calculation for max body size:
+/// compressed G1 point is 32 bytes and a G2 point 64, so a circuit that needs 2^20 
 /// generators per MSM lands around 192 MiB.
-///
-/// It is a real tradeoff, not a free knob — the body is buffered in memory
-/// before decoding, so worst-case footprint is about
-/// `max_body_bytes * max_concurrent_msm`. [`ServerConfig::peak_body_bytes`]
-/// reports that product so an operator can see it at startup.
+/// (client side proof generation circuit constraints dont exceed 2^20 MOSTLY)
+/// 
+/// See [`ServerConfig::peak_body_bytes`] for more.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
-/// Configuration for [`crate::protocol::server`].
+/// Server Configuration
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     /// Address to bind. Defaults to loopback rather than `0.0.0.0` so an
@@ -141,11 +138,10 @@ impl Default for ServerConfig {
     }
 }
 
-/// Half the available cores, clamped to `[1, 4]`.
+/// Half the available cores and clamp to [1, 4].
 ///
-/// Not one-per-core: each MSM fans out over rayon internally, so the useful
-/// range for *concurrent* MSMs is small, and the upper clamp keeps peak memory
-/// predictable on a many-core box.
+/// each MSM fans out over rayon internally, so the range for concurrent MSMs is small, 
+/// and the upper clamp keeps peak memory predictable
 fn default_concurrency() -> usize {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -154,10 +150,7 @@ fn default_concurrency() -> usize {
 }
 
 impl ServerConfig {
-    /// Read configuration from the environment, falling back to [`Default`].
-    ///
-    /// Every variable is prefixed `STEALTHSNARK_`. A malformed value is an
-    /// error, never a silent default.
+    /// Read configuration from the environment falling back to [`Default`].
     pub fn from_env() -> anyhow::Result<Self> {
         let d = Self::default();
         Ok(Self {
@@ -212,12 +205,17 @@ impl ServerConfig {
             anyhow::bail!("STEALTHSNARK_QUOTA_BUCKET_IDLE_SECS must be >= 1");
         }
 
-        // The safety interlock. Unauthenticated on loopback is a convenience for
-        // development. Unauthenticated on a routable address is an open service,
-        // and that is never worth inferring from a missing variable.
+        if self.tls.is_none() && !self.bind_addr.ip().is_loopback() {
+            anyhow::bail!(
+                "refusing to serve plain HTTP on {}. Either configure TLS or bind to loopback \
+                behind a reverse proxy",
+                self.bind_addr
+            );
+        }
+        
         if !self.auth_mode.is_enabled() && !self.bind_addr.ip().is_loopback() {
             anyhow::bail!(
-                "refusing to bind {} with authentication disabled; \
+                "refusing to bind {} with authentication disabled. \
                  set STEALTHSNARK_AUTH=apikey|mtls|any and STEALTHSNARK_AUTH_FILE",
                 self.bind_addr
             );
@@ -250,13 +248,13 @@ impl ServerConfig {
 
         if self.bind_addr == self.admin_bind_addr {
             anyhow::bail!(
-                "STEALTHSNARK_BIND and STEALTHSNARK_ADMIN_BIND must differ; \
-                 the admin plane is unauthenticated and must not share the data port"
+                "STEALTHSNARK_BIND and STEALTHSNARK_ADMIN_BIND must differ. \
+                 The admin plane is unauthenticated and must not share the data port"
             );
         }
         if !self.admin_bind_addr.ip().is_loopback() {
             anyhow::bail!(
-                "refusing to expose the admin plane on {}; /metrics reports internal state",
+                "refusing to expose the admin plane on {}. /metrics reports internal state",
                 self.admin_bind_addr
             );
         }
@@ -277,8 +275,8 @@ impl ServerConfig {
         }
     }
 
-    /// Worst-case resident bytes from in-flight request bodies alone. Logged at
-    /// startup so an operator sees the memory envelope they just configured.
+    /// Returns worst-case resident bytes from requests at maximum available throughput. 
+    /// Logged at startup so an operator sees the memory envelope they just configured.
     pub fn peak_body_bytes(&self) -> usize {
         self.max_body_bytes.saturating_mul(self.max_concurrent_msm)
     }
@@ -359,7 +357,6 @@ mod tests {
     fn default_is_valid_and_loopback_only() {
         let c = ServerConfig::default();
         c.validate().unwrap();
-        // Binding 0.0.0.0 by default would expose an unauthenticated service.
         assert!(c.bind_addr.ip().is_loopback());
     }
 
@@ -414,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn unauthenticated_service_may_not_bind_a_routable_address() {
+    fn unauthenticated_service_should_not_bind_a_routable_address() {
         // The interlock that matters most: no missing variable can produce an
         // open service on a network interface.
         let open = ServerConfig {
@@ -422,18 +419,19 @@ mod tests {
             auth_mode: AuthMode::Disabled,
             ..ServerConfig::default()
         };
-        let err = open.validate().unwrap_err();
-        assert!(err.to_string().contains("authentication disabled"), "{err}");
+        assert!(open.validate().is_err());
 
         // Loopback with auth off stays allowed, for development.
         assert!(ServerConfig::default().validate().is_ok());
 
-        // A routable address is fine once auth is on.
+        // Auth alone is not enough. The API key travels in `Authorization` on
+        // every request, so plain HTTP on a routable address leaks a bearer
+        // credential however the caller authenticates.
         let closed = ServerConfig {
             bind_addr: "0.0.0.0:3000".parse().unwrap(),
             ..authed(AuthMode::ApiKey)
         };
-        assert!(closed.validate().is_ok());
+        assert!(closed.validate().is_err());
     }
 
     #[test]

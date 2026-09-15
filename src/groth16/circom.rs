@@ -23,7 +23,7 @@ pub fn circom_setup<R: Rng + CryptoRng>(
 /// Build a Circom circuit with witness from the given inputs.
 ///
 /// Each input is `(name, value)`. For array inputs, push multiple times with
-/// the same name (the builder accumulates them).
+/// the same name.
 pub fn build_circuit(
     wasm: impl AsRef<Path>,
     r1cs: impl AsRef<Path>,
@@ -38,7 +38,6 @@ pub fn build_circuit(
     Ok(circuit)
 }
 
-/// Extract public inputs from a built circuit (with witness).
 pub fn get_public_inputs(circuit: &CircomCircuit<Fr>) -> Option<Vec<Fr>> {
     circuit.get_public_inputs()
 }
@@ -74,13 +73,11 @@ mod tests {
         }
         let mut rng = ChaCha20Rng::seed_from_u64(42);
 
-        // Setup
         let (pk, vk) = circom_setup(MULTIPLIER2_WASM, MULTIPLIER2_R1CS, &mut rng)
             .expect("circom setup failed");
 
         let sapk = ServerAidedProvingKey::setup(pk, &mut rng);
 
-        // Build circuit with witness: a=3, b=11 → c=33
         let circuit = build_circuit(
             MULTIPLIER2_WASM,
             MULTIPLIER2_R1CS,
@@ -90,13 +87,11 @@ mod tests {
 
         let public_inputs = get_public_inputs(&circuit).expect("no public inputs");
 
-        // Encrypt → server evaluate → decrypt
         let (request, state) = client_encrypt::<CircomReduction, _, _>(&sapk, circuit, &mut rng)
             .expect("encrypt failed");
         let response = server_evaluate(&sapk, &request).expect("server evaluate failed");
         let proof = client_decrypt(&sapk, &response, &state);
 
-        // Verify
         let valid = Groth16::<Bn254, CircomReduction>::verify(&vk, &public_inputs, &proof)
             .expect("verification failed");
         assert!(valid, "multiplier2 proof should verify (3*11=33)");
@@ -109,25 +104,22 @@ mod tests {
         }
         let mut rng = ChaCha20Rng::seed_from_u64(99);
 
-        // Setup
         let (pk, vk) = circom_setup(RANGE_CHECK_WASM, RANGE_CHECK_R1CS, &mut rng)
             .expect("circom setup failed");
 
         let sapk = ServerAidedProvingKey::setup(pk, &mut rng);
 
-        // Build circuit with witness: value=200 (fits in 8 bits, 0..255)
+
         let circuit = build_circuit(RANGE_CHECK_WASM, RANGE_CHECK_R1CS, &[("value", 200.into())])
             .expect("build circuit failed");
 
         let public_inputs = get_public_inputs(&circuit).expect("no public inputs");
 
-        // Encrypt → server evaluate → decrypt
         let (request, state) = client_encrypt::<CircomReduction, _, _>(&sapk, circuit, &mut rng)
             .expect("encrypt failed");
         let response = server_evaluate(&sapk, &request).expect("server evaluate failed");
         let proof = client_decrypt(&sapk, &response, &state);
 
-        // Verify
         let valid = Groth16::<Bn254, CircomReduction>::verify(&vk, &public_inputs, &proof)
             .expect("verification failed");
         assert!(
