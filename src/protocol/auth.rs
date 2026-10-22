@@ -26,6 +26,10 @@ pub const API_KEY_PREFIX: &str = "ssk";
 const KEY_ID_BYTES: usize = 8; // 16 hex characters
 const KEY_SECRET_BYTES: usize = 32; // 64 hex characters, 256 bits
 
+/// Compared against when the key id is unknown. No SHA-256 output is all zeros
+/// in practice, so it never matches.
+const UNKNOWN_KEY_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
 /// Which credentials the server accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthMode {
@@ -384,13 +388,19 @@ impl AuthStore {
         // Distinguishing them would tell an attacker which key ids exist.
         let invalid = || ApiError::Unauthenticated("invalid API key".to_string());
 
-        let record = self.by_key_id.get(&key_id).ok_or_else(invalid)?;
-        let expected = record.api_key_sha256.as_deref().ok_or_else(invalid)?;
+        // Hash and compare on every path, so an unknown key id takes the same
+        // time as a wrong secret and the time does not show which ids exist.
+        let digest = sha256_hex(secret.as_bytes());
+        let record = self.by_key_id.get(&key_id);
+        let expected = record
+            .and_then(|r| r.api_key_sha256.as_deref())
+            .unwrap_or(UNKNOWN_KEY_DIGEST);
+        let matches = constant_time_eq(&digest, expected);
 
-        if !constant_time_eq(&sha256_hex(secret.as_bytes()), expected) {
-            return Err(invalid());
+        match record {
+            Some(record) if matches => Ok(self.principal_from(record, AuthMethod::ApiKey)),
+            _ => Err(invalid()),
         }
-        Ok(self.principal_from(record, AuthMethod::ApiKey))
     }
 
     fn principal_from(&self, record: &Record, method: AuthMethod) -> Principal {
