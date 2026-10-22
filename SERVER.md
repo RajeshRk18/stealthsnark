@@ -122,6 +122,53 @@ STEALTHSNARK_CLIENT_IDENTITY=client-identity.pem
 TLS is behind the `tls` feature, on by default. With the feature off, a configured
 TLS path is a startup error, not a downgrade to plain HTTP.
 
+## Running under systemd
+
+The server holds untrusted data in memory and needs no privileges. Run it as its
+own user, with an OS memory limit as a second line behind
+`STEALTHSNARK_MAX_RESIDENT_BYTES` and `peak_body_mib`.
+
+```ini
+[Unit]
+Description=StealthSnark MSM server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=stealthsnark
+Group=stealthsnark
+EnvironmentFile=/etc/stealthsnark/env
+ExecStart=/usr/local/bin/stealthsnark-server
+# SIGHUP reloads the auth file.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+# Above STEALTHSNARK_MAX_RESIDENT_BYTES + peak_body_mib + about 1 GiB.
+MemoryMax=12G
+# The default 90 s would kill proofs that are still draining after SIGTERM.
+# Use STEALTHSNARK_REQUEST_TIMEOUT_SECS plus a margin.
+TimeoutStopSec=660
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+ReadOnlyPaths=/etc/stealthsnark
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Keep the TLS key and the auth file in `/etc/stealthsnark`, owned by the
+`stealthsnark` user, with mode `600`. The server warns at startup when the key
+file is readable by group or other users. A port below 1024 needs
+`AmbientCapabilities=CAP_NET_BIND_SERVICE`, and then `CapabilityBoundingSet`
+must include it too.
+
 ## Configuration
 
 | Variable | Default | Purpose |
