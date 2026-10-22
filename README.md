@@ -81,7 +81,7 @@ CLIENT                                             SERVER
    ┌────────────┐       │  ┌──────────────────────────────────────────────────────────────┐  │
    │ prometheus │──HTTP►│  │ /livez    always 200 if the process is up                    │  │
    │ or probe   │       │  │ /readyz   503 when draining or when 0 MSM slots are free     │  │
-   └────────────┘       │  │ /metrics  14 counters, 4 gauges, Prometheus text             │  │
+   └────────────┘       │  │ /metrics  13 counters, 4 gauges, Prometheus text             │  │
                         │  └──────────────────────────────────────────────────────────────┘  │
                         └────────────────────────────────────────────────────────────────────┘
 ```

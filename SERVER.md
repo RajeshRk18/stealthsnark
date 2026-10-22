@@ -141,6 +141,7 @@ TLS path is a startup error, not a downgrade to plain HTTP.
 | `STEALTHSNARK_API_KEY` | none | Client binary only. |
 | `STEALTHSNARK_CA_CERT` | none | Client binary only: trust a private CA. |
 | `STEALTHSNARK_CLIENT_IDENTITY` | none | Client binary only: certificate and key in one PEM for mTLS. |
+| `STEALTHSNARK_MALICIOUS` | unset | Client binary only: `1` uses malicious-secure mode, which sends two `/v1/prove` calls per proof and detects a cheating server. |
 
 Server startup refuses these mis-configs:
 

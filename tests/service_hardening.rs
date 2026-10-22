@@ -466,10 +466,6 @@ async fn metrics_reflect_traffic() {
     let before = scrape(admin_url.clone()).await;
     assert!(before.contains("stealthsnark_setup_requests_ok_total 0"));
     assert!(before.contains("stealthsnark_active_sessions 0"));
-    assert!(
-        before.contains("stealthsnark_consistency_check_failures_total 0"),
-        "the cheating-server counter must be exported"
-    );
 
     let version = PROTOCOL_VERSION.to_string();
     post_setup(&data_url, generators_body(8, 55), Some(&version)).await;

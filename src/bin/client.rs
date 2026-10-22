@@ -7,8 +7,11 @@ use ark_snark::SNARK;
 use rand::rngs::OsRng;
 
 use stealthsnark::groth16::circom::{build_circuit, circom_setup, get_public_inputs};
-use stealthsnark::groth16::server_aided::{client_decrypt, client_encrypt, ServerAidedProvingKey};
-use stealthsnark::protocol::client::EmsmClient;
+use stealthsnark::groth16::server_aided::{
+    client_decrypt, client_encrypt, malicious_client_decrypt, malicious_client_encrypt,
+    ServerAidedProvingKey,
+};
+use stealthsnark::protocol::client::{decode_prove_response, EmsmClient};
 use stealthsnark::protocol::messages::*;
 
 const MULTIPLIER2_WASM: &str = "circuits/build/multiplier2_js/multiplier2.wasm";
@@ -54,31 +57,36 @@ async fn main() -> anyhow::Result<()> {
         &[("a", 3.into()), ("b", 11.into())],
     )?;
     let public_inputs = get_public_inputs(&circuit).expect("no public inputs");
-    let (request, state) = client_encrypt::<CircomReduction, _, _>(&sapk, circuit, &mut rng)?;
 
-    // Send masked vectors to server
-    println!("[5/6] Delegating MSM computation to server...");
-    let prove_request = ProveRequest::encode(
-        &request.v_h,
-        &request.v_l,
-        &request.v_a,
-        &request.v_b_g1,
-        &request.v_b_g2,
-    )?;
-    let prove_response = http_client.send_prove(&prove_request).await?;
-
-    // Decode server response back to group elements
-    let server_response = stealthsnark::groth16::server_aided::ServerResponse {
-        em_h: ark_from_bytes::<G1Affine>(&prove_response.em_h)?.into(),
-        em_l: ark_from_bytes::<G1Affine>(&prove_response.em_l)?.into(),
-        em_a: ark_from_bytes::<G1Affine>(&prove_response.em_a)?.into(),
-        em_b_g1: ark_from_bytes::<G1Affine>(&prove_response.em_b_g1)?.into(),
-        em_b_g2: ark_from_bytes::<G2Affine>(&prove_response.em_b_g2)?.into(),
+    // Malicious-secure mode sends two queries per MSM and detects a cheating server.
+    let malicious = std::env::var("STEALTHSNARK_MALICIOUS").is_ok_and(|v| v == "1");
+    let proof = if malicious {
+        let (request, state) =
+            malicious_client_encrypt::<CircomReduction, _, _>(&sapk, circuit, &mut rng)?;
+        println!("[5/6] Delegating MSM computation to server (malicious-secure, 2 queries)...");
+        let response = http_client.send_prove_malicious(&request, &mut rng).await?;
+        println!("[6/6] Checking consistency, decrypting proof and verifying...");
+        match malicious_client_decrypt(&sapk, &response, &state) {
+            Ok(proof) => proof,
+            Err(e) => {
+                tracing::error!(error = %e, server = %server_url, "server returned inconsistent MSM results");
+                anyhow::bail!("{e}");
+            }
+        }
+    } else {
+        let (request, state) = client_encrypt::<CircomReduction, _, _>(&sapk, circuit, &mut rng)?;
+        println!("[5/6] Delegating MSM computation to server...");
+        let prove_request = ProveRequest::encode(
+            &request.v_h,
+            &request.v_l,
+            &request.v_a,
+            &request.v_b_g1,
+            &request.v_b_g2,
+        )?;
+        let prove_response = http_client.send_prove(&prove_request).await?;
+        println!("[6/6] Decrypting proof and verifying...");
+        client_decrypt(&sapk, &decode_prove_response(&prove_response)?, &state)
     };
-
-    // Decrypt and verify
-    println!("[6/6] Decrypting proof and verifying...");
-    let proof = client_decrypt(&sapk, &server_response, &state);
     let valid = Groth16::<Bn254, CircomReduction>::verify(&vk, &public_inputs, &proof)?;
 
     // Free the server's copy of the generators rather than leaving them pinned

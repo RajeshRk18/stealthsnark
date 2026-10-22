@@ -11,8 +11,15 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
+use ark_bn254::{G1Affine, G2Affine};
+use rand::Rng;
+
+use crate::groth16::server_aided::{
+    MaliciousEncryptedRequest, MaliciousServerResponse, ServerResponse,
+};
 
 use super::messages::{
+    ark_from_bytes,
     wire_decode, wire_encode, ProveRequest, ProveResponse, ReleaseAllResponse, SetupRequest,
     SetupResponse, PROTOCOL_VERSION, SESSION_HEADER, VERSION_HEADER,
 };
@@ -220,6 +227,52 @@ impl EmsmClient {
         wire_decode(&bytes)
     }
 
+    /// Malicious-secure prove: the main query and the check query go as two
+    /// `/v1/prove` calls on this session, in random order, so the server cannot
+    /// tell which one is the check. Pass the result to
+    /// [`crate::groth16::server_aided::malicious_client_decrypt`], which detects a
+    /// server that cheated on either call.
+    pub async fn send_prove_malicious<R: Rng>(
+        &self,
+        request: &MaliciousEncryptedRequest,
+        rng: &mut R,
+    ) -> Result<MaliciousServerResponse> {
+        let r = request;
+        let main = ProveRequest::encode(
+            &r.h.masked,
+            &r.l.masked,
+            &r.a.masked,
+            &r.b_g1.masked,
+            &r.b_g2.masked,
+        )?;
+        let check = ProveRequest::encode(
+            &r.h.masked_check,
+            &r.l.masked_check,
+            &r.a.masked_check,
+            &r.b_g1.masked_check,
+            &r.b_g2.masked_check,
+        )?;
+
+        let check_first: bool = rng.gen();
+        let (first, second) = if check_first { (&check, &main) } else { (&main, &check) };
+        let first = decode_prove_response(&self.send_prove(first).await?)?;
+        let second = decode_prove_response(&self.send_prove(second).await?)?;
+        let (m, c) = if check_first { (second, first) } else { (first, second) };
+
+        Ok(MaliciousServerResponse {
+            em_h: m.em_h,
+            em_h_ck: c.em_h,
+            em_l: m.em_l,
+            em_l_ck: c.em_l,
+            em_a: m.em_a,
+            em_a_ck: c.em_a,
+            em_b_g1: m.em_b_g1,
+            em_b_g1_ck: c.em_b_g1,
+            em_b_g2: m.em_b_g2,
+            em_b_g2_ck: c.em_b_g2,
+        })
+    }
+
     /// `DELETE /v1/session` free the server's copy of the generators
     ///
     /// Rationale behind this API:
@@ -282,6 +335,17 @@ impl EmsmClient {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("no session yet. call send_setup first"))
     }
+}
+
+/// Decode the five MSM results of a `/v1/prove` response.
+pub fn decode_prove_response(pr: &ProveResponse) -> Result<ServerResponse> {
+    Ok(ServerResponse {
+        em_h: ark_from_bytes::<G1Affine>(&pr.em_h)?.into(),
+        em_l: ark_from_bytes::<G1Affine>(&pr.em_l)?.into(),
+        em_a: ark_from_bytes::<G1Affine>(&pr.em_a)?.into(),
+        em_b_g1: ark_from_bytes::<G1Affine>(&pr.em_b_g1)?.into(),
+        em_b_g2: ark_from_bytes::<G2Affine>(&pr.em_b_g2)?.into(),
+    })
 }
 
 /// Turn a non-2xx response into an error carrying the server's structured

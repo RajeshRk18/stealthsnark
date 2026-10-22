@@ -22,7 +22,10 @@ that was locked down. It is an adversary the protocol tolerates:
 - Scalars arrive masked with LPN-derived noise, so their values are statistically
   independent of the witness.
 - In malicious mode the client sends two queries per MSM and cross-checks them, so
-  a wrong result is caught with probability about `1 - 2^-254`.
+  a wrong result is caught with probability about `1 - 2^-254`. On the wire these
+  are two `/v1/prove` calls on one session, in random order
+  (`EmsmClient::send_prove_malicious`), so the server cannot tell which one is the
+  check.
 
 So confidentiality of the payload is not the backend's job. The cryptography
 already has it. The backend's job is availability, isolation between clients, and
@@ -627,19 +630,17 @@ means a client cannot connect at all, and the rustls error text is the only thin
 that says why. At `debug` the operator sees an unreachable service and a silent
 server.
 
-`/metrics` renders 14 counters and 4 gauges from atomics, hand-rolled rather than
+`/metrics` renders 13 counters and 4 gauges from atomics, hand-rolled rather than
 via a metrics framework, because the render is a `writeln!` loop.
 
-Two metrics deserve alerts:
+`rejected_unauthenticated_total` deserves an alert: a sustained rise is credential
+guessing.
 
-| Metric | Meaning |
-|---|---|
-| `consistency_check_failures_total` | a server returned inconsistent MSM results, so it cheated or corrupted data |
-| `rejected_unauthenticated_total` | a sustained rise is credential guessing |
-
-The first is the most important signal the system can emit. Before this work it
-existed only as a `Result` on the client side that nothing aggregated. It is
-exported as zero so an alert can be written before it ever fires.
+A failed malicious-mode consistency check is the most important signal the system
+can emit, but only the client can see it: the check runs on the client, after both
+responses arrive. A server metric for it would always be zero. The client reports
+it as `MaliciousError::ConsistencyCheckFailed`, and the demo client logs it at
+`error`.
 
 ## 13. Health, readiness, shutdown
 

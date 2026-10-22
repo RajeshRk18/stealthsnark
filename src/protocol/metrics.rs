@@ -39,9 +39,6 @@ pub struct Metrics {
     /// Requests refused because a body exceeded the principal's tier.
     pub rejected_body_too_large: AtomicU64,
 
-    /// Malicious-mode consistency check failures. Non-zero means a server
-    /// returned inconsistent MSM results.
-    pub consistency_check_failures: AtomicU64,
 }
 
 impl Metrics {
@@ -83,7 +80,7 @@ impl Metrics {
         let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
         let mut out = String::with_capacity(4096);
 
-        let counters: [(&str, &str, u64); 14] = [
+        let counters: [(&str, &str, u64); 13] = [
             (
                 "stealthsnark_setup_requests_ok_total",
                 "Successful /v1/setup requests.",
@@ -128,11 +125,6 @@ impl Metrics {
                 "stealthsnark_sessions_evicted_total",
                 "Sessions evicted after exceeding their idle TTL.",
                 g(&self.sessions_evicted),
-            ),
-            (
-                "stealthsnark_consistency_check_failures_total",
-                "Malicious-mode consistency check failures. Non-zero means a server cheated.",
-                g(&self.consistency_check_failures),
             ),
             (
                 "stealthsnark_rejected_unauthenticated_total",
@@ -214,7 +206,7 @@ mod tests {
         let helps = text.matches("# HELP ").count();
         let types = text.matches("# TYPE ").count();
         assert_eq!(helps, types);
-        assert_eq!(helps, 18);
+        assert_eq!(helps, 17);
     }
 
     #[test]

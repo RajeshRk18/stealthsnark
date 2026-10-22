@@ -126,13 +126,7 @@ pub fn prove_request(req: &EncryptedRequest) -> ProveRequest<'static> {
 }
 
 pub fn decode_response(pr: &ProveResponse) -> ServerResponse {
-    ServerResponse {
-        em_h: ark_from_bytes::<G1Affine>(&pr.em_h).unwrap().into(),
-        em_l: ark_from_bytes::<G1Affine>(&pr.em_l).unwrap().into(),
-        em_a: ark_from_bytes::<G1Affine>(&pr.em_a).unwrap().into(),
-        em_b_g1: ark_from_bytes::<G1Affine>(&pr.em_b_g1).unwrap().into(),
-        em_b_g2: ark_from_bytes::<G2Affine>(&pr.em_b_g2).unwrap().into(),
-    }
+    stealthsnark::protocol::client::decode_prove_response(pr).unwrap()
 }
 
 /// Send a raw request with the correct version header, and optionally a client

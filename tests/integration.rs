@@ -112,3 +112,85 @@ async fn test_session_isolation() {
     let stale = client_b.send_prove(&prove_request(&request2)).await;
     assert!(stale.is_err(), "released session must not still prove");
 }
+
+#[tokio::test]
+async fn malicious_secure_proof_over_the_wire_verifies() {
+    use stealthsnark::groth16::server_aided::{malicious_client_decrypt, malicious_client_encrypt};
+
+    let mut rng = ChaCha20Rng::seed_from_u64(7);
+    let (server_url, state) = spawn_server().await;
+    let (pk, vk) =
+        Groth16::<Bn254>::circuit_specific_setup(CubeCircuit::<Fr> { x: None }, &mut rng).unwrap();
+    let sapk = ServerAidedProvingKey::setup(pk, &mut rng);
+
+    let mut client = EmsmClient::new(&server_url).unwrap();
+    client.send_setup(&setup_request(&sapk)).await.unwrap();
+
+    let circuit = CubeCircuit { x: Some(Fr::from(3u64)) };
+    let (request, enc_state) =
+        malicious_client_encrypt::<LibsnarkReduction, _, _>(&sapk, circuit, &mut rng).unwrap();
+    let response = client.send_prove_malicious(&request, &mut rng).await.unwrap();
+
+    let proof = malicious_client_decrypt(&sapk, &response, &enc_state)
+        .expect("an honest server passes the consistency check");
+    assert!(Groth16::<Bn254>::verify(&vk, &[Fr::from(35u64)], &proof).unwrap());
+    // Both queries went to the same session as two /v1/prove calls.
+    assert_eq!(state.metrics.prove_ok.load(std::sync::atomic::Ordering::Relaxed), 2);
+}
+
+/// A server that returns well-formed but wrong MSM results is caught.
+#[tokio::test]
+async fn malicious_secure_mode_detects_a_cheating_server() {
+    use ark_ec::AffineRepr;
+    use axum::routing::post;
+    use stealthsnark::groth16::server_aided::{malicious_client_decrypt, malicious_client_encrypt};
+    use stealthsnark::protocol::messages::{ark_to_bytes, wire_encode, ProveResponse, SetupResponse};
+
+    // Answers every prove with the identity point, whatever the input.
+    let cheat = axum::Router::new()
+        .route(
+            "/v1/setup",
+            post(|| async {
+                wire_encode(&SetupResponse {
+                    session_token: "t".into(),
+                    session_label: "l".into(),
+                })
+                .unwrap()
+            }),
+        )
+        .route(
+            "/v1/prove",
+            post(|| async {
+                let g1 = ark_to_bytes(&ark_bn254::G1Affine::zero()).unwrap();
+                let g2 = ark_to_bytes(&ark_bn254::G2Affine::zero()).unwrap();
+                wire_encode(&ProveResponse {
+                    em_h: g1.clone(),
+                    em_l: g1.clone(),
+                    em_a: g1.clone(),
+                    em_b_g1: g1,
+                    em_b_g2: g2,
+                })
+                .unwrap()
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, cheat).await });
+
+    let mut rng = ChaCha20Rng::seed_from_u64(8);
+    let (pk, _vk) =
+        Groth16::<Bn254>::circuit_specific_setup(CubeCircuit::<Fr> { x: None }, &mut rng).unwrap();
+    let sapk = ServerAidedProvingKey::setup(pk, &mut rng);
+    let mut client = EmsmClient::new(&url).unwrap();
+    client.send_setup(&setup_request(&sapk)).await.unwrap();
+
+    let circuit = CubeCircuit { x: Some(Fr::from(3u64)) };
+    let (request, enc_state) =
+        malicious_client_encrypt::<LibsnarkReduction, _, _>(&sapk, circuit, &mut rng).unwrap();
+    let response = client.send_prove_malicious(&request, &mut rng).await.unwrap();
+
+    assert!(matches!(
+        malicious_client_decrypt(&sapk, &response, &enc_state),
+        Err(stealthsnark::emsm::malicious::MaliciousError::ConsistencyCheckFailed)
+    ));
+}
