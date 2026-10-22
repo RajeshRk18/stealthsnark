@@ -330,24 +330,38 @@ async fn serve_data_plane(state: AppState) -> anyhow::Result<()> {
     }
 }
 
+/// Connection-level limits for the TLS listener. `serve_tls` sets the timer that
+/// the HTTP/1 header timeout needs: without a timer hyper ignores its default.
+#[cfg(feature = "tls")]
+const H2_MAX_CONCURRENT_STREAMS: u32 = 8;
+#[cfg(feature = "tls")]
+const H2_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// TLS accept loop.
 ///
 /// Hand-rolled because `axum::serve` cannot expose the peer certificate. Each accepted
 /// connection completes its handshake, the peer certificate digest goes into the
 /// request extensions, and hyper will start serving the connection.
+///
+/// On shutdown it stops accepting, tells each open connection to finish its
+/// current requests and close, and returns when all have closed or after
+/// `request_timeout`.
 #[cfg(feature = "tls")]
-async fn serve_tls(
+pub async fn serve_tls(
     listener: tokio::net::TcpListener,
     state: AppState,
     tls_config: rustls::ServerConfig,
 ) -> anyhow::Result<()> {
-    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
     use hyper_util::server::conn::auto::Builder as ConnBuilder;
+    use hyper_util::server::graceful::GracefulShutdown;
     use tower::Service;
 
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
     let router = create_router(state.clone());
     let connections = Arc::new(tokio::sync::Semaphore::new(1024));
+    let graceful = GracefulShutdown::new();
+    let header_read_timeout = state.config.header_read_timeout;
 
     loop {
         // Stop accepting as soon as shutdown begins, but let live connections
@@ -372,6 +386,9 @@ async fn serve_tls(
             tracing::warn!(%peer, "connection limit reached; dropping");
             continue;
         };
+
+        // Subscribed before the handshake, so shutdown also waits for it.
+        let watcher = graceful.watcher();
 
         tokio::spawn(async move {
             let _permit = permit;
@@ -416,16 +433,35 @@ async fn serve_tls(
                 router.clone().call(request)
             });
 
-            if let Err(e) = ConnBuilder::new(TokioExecutor::new())
-                .serve_connection_with_upgrades(io, service)
-                .await
-            {
+            let mut builder = ConnBuilder::new(TokioExecutor::new());
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(header_read_timeout);
+            builder
+                .http2()
+                .timer(TokioTimer::new())
+                .max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS)
+                .keep_alive_interval(H2_KEEP_ALIVE_INTERVAL);
+
+            let conn = builder.serve_connection(io, service);
+            if let Err(e) = watcher.watch(conn).await {
                 tracing::debug!(%peer, error = %e, "connection closed with error");
             }
         });
     }
 
-    tracing::info!("TLS listener stopped accepting new connections");
+    tracing::info!(
+        open_connections = graceful.count(),
+        "TLS listener stopped accepting new connections; draining"
+    );
+    let limit = state.config.request_timeout;
+    if tokio::time::timeout(limit, graceful.shutdown()).await.is_err() {
+        tracing::warn!(
+            limit_secs = limit.as_secs(),
+            "TLS connections still open after the drain limit; closing them"
+        );
+    }
     Ok(())
 }
 

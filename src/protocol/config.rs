@@ -98,6 +98,11 @@ pub struct ServerConfig {
     /// How long a request waits for an upload or MSM slot before being shed with 503.
     pub admission_wait: Duration,
 
+    /// Time a TLS connection has to send complete request headers. Without it, a
+    /// client that sends header bytes very slowly holds a connection slot for as
+    /// long as it wants, before any authentication runs.
+    pub header_read_timeout: Duration,
+
     /// Per-request wall-clock ceiling. Generous by default, because a large
     /// honest MSM legitimately takes minutes.
     pub request_timeout: Duration,
@@ -142,6 +147,7 @@ impl Default for ServerConfig {
             max_concurrent_uploads: 2 * default_concurrency(),
             admission_wait: Duration::from_secs(30),
             request_timeout: Duration::from_secs(600),
+            header_read_timeout: Duration::from_secs(10),
             // Off by default so that `cargo run --bin server` still works on a
             // developer machine. It is safe only because `validate` refuses this
             // combination on any non-loopback bind address.
@@ -184,6 +190,10 @@ impl ServerConfig {
             )?,
             admission_wait: env_secs("STEALTHSNARK_ADMISSION_WAIT_SECS", d.admission_wait)?,
             request_timeout: env_secs("STEALTHSNARK_REQUEST_TIMEOUT_SECS", d.request_timeout)?,
+            header_read_timeout: env_secs(
+                "STEALTHSNARK_HEADER_READ_TIMEOUT_SECS",
+                d.header_read_timeout,
+            )?,
             auth_mode: env_or("STEALTHSNARK_AUTH", d.auth_mode)?,
             auth_file: env_path("STEALTHSNARK_AUTH_FILE")?,
             tls: tls_from_env()?,
@@ -231,6 +241,9 @@ impl ServerConfig {
                 self.session_max_age.as_secs(),
                 self.session_ttl.as_secs()
             );
+        }
+        if self.header_read_timeout.is_zero() {
+            anyhow::bail!("STEALTHSNARK_HEADER_READ_TIMEOUT_SECS must be >= 1");
         }
         if self.quota_bucket_idle.is_zero() {
             anyhow::bail!("STEALTHSNARK_QUOTA_BUCKET_IDLE_SECS must be >= 1");

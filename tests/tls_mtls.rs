@@ -16,6 +16,7 @@ mod common;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ark_bn254::{G1Affine, G1Projective as G1, G2Affine};
@@ -30,7 +31,7 @@ use stealthsnark::protocol::auth::{
 use stealthsnark::protocol::client::EmsmClient;
 use stealthsnark::protocol::config::{ServerConfig, TlsPaths};
 use stealthsnark::protocol::messages::*;
-use stealthsnark::protocol::server::{create_router, AppState};
+use stealthsnark::protocol::server::AppState;
 use stealthsnark::protocol::tls;
 
 /// A throwaway CA with a server certificate and two client certificates.
@@ -129,56 +130,34 @@ fn roomy_tier() -> HashMap<String, TierSpec> {
     t
 }
 
-/// Serve the data plane over TLS on an ephemeral port. Returns the base URL.
-///
-/// This mirrors `protocol::server::serve_tls`: accept, handshake, insert the peer
-/// certificate digest, then hand the connection to hyper. Reimplemented here
-/// because the test needs the bound port back, which `serve` does not return.
+/// Serve the data plane over TLS on an ephemeral port with the real
+/// `serve_tls` loop. Returns the base URL.
 async fn spawn_tls(cfg: ServerConfig, auth: AuthStore) -> (String, AppState) {
-    use hyper_util::rt::{TokioExecutor, TokioIo};
-    use hyper_util::server::conn::auto::Builder as ConnBuilder;
-    use tower::Service;
+    let (url, state, _server) = spawn_tls_task(cfg, auth).await;
+    (url, state)
+}
 
+/// [`spawn_tls`], also returning the server task, for shutdown tests.
+async fn spawn_tls_task(
+    cfg: ServerConfig,
+    auth: AuthStore,
+) -> (String, AppState, tokio::task::JoinHandle<anyhow::Result<()>>) {
     let tls_paths = cfg.tls.clone().expect("test config must carry TLS paths");
     let require_cert = cfg.auth_mode.requires_client_cert();
     let state = AppState::with_auth(cfg, auth);
-
     let tls_config = tls::server_config(&tls_paths, require_cert).expect("valid TLS config");
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let router = create_router(state.clone());
-
-    tokio::spawn(async move {
-        loop {
-            let Ok((stream, _peer)) = listener.accept().await else {
-                continue;
-            };
-            let acceptor = acceptor.clone();
-            let router = router.clone();
-            tokio::spawn(async move {
-                let Ok(tls_stream) = acceptor.accept(stream).await else {
-                    return;
-                };
-                let digest = tls::peer_digest(tls_stream.get_ref().1);
-                let io = TokioIo::new(tls_stream);
-                let service = hyper::service::service_fn(move |mut req: axum::http::Request<_>| {
-                    if let Some(d) = digest.clone() {
-                        req.extensions_mut().insert(tls::PeerCertDigest(d));
-                    }
-                    router.clone().call(req)
-                });
-                let _ = ConnBuilder::new(TokioExecutor::new())
-                    .serve_connection_with_upgrades(io, service)
-                    .await;
-            });
-        }
-    });
+    let server = tokio::spawn(stealthsnark::protocol::server::serve_tls(
+        listener,
+        state.clone(),
+        tls_config,
+    ));
 
     // `localhost`, not 127.0.0.1: the server certificate's SAN says localhost, and
     // dialling the IP would fail verification for the wrong reason.
-    (format!("https://localhost:{port}"), state)
+    (format!("https://localhost:{port}"), state, server)
 }
 
 fn generators_body(n: usize, seed: u64) -> Vec<u8> {
@@ -553,4 +532,82 @@ fn cert_auth(digest: &str, id: &str, mode: AuthMode) -> AuthStore {
         mode,
     )
     .unwrap()
+}
+
+/// A raw TLS connection to the test server, for requests reqwest cannot shape.
+async fn raw_tls(pki: &Pki, url: &str) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut pki.ca_pem.as_bytes()) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let port = url.rsplit(':').next().unwrap();
+    let tcp = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(name, tcp)
+        .await
+        .unwrap()
+}
+
+/// A client that sends its headers very slowly is disconnected after
+/// `header_read_timeout`, so it cannot hold a connection slot for ever.
+#[tokio::test]
+async fn a_slow_header_sender_is_disconnected() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let pki = build_pki();
+    let cfg = ServerConfig {
+        header_read_timeout: Duration::from_secs(1),
+        ..tls_config(&pki, AuthMode::Disabled, false)
+    };
+    let (url, _state) = spawn_tls(cfg, AuthStore::disabled()).await;
+
+    let mut conn = raw_tls(&pki, &url).await;
+    conn.write_all(b"POST /v1/setup HTTP/1.1\r\nHost: localhost\r\n").await.unwrap();
+
+    let mut buf = [0u8; 256];
+    let read = tokio::time::timeout(Duration::from_secs(5), conn.read(&mut buf)).await;
+    assert!(read.is_ok(), "the server kept a connection with incomplete headers open");
+}
+
+/// On shutdown the TLS listener waits for a request in progress to be answered
+/// before it returns, instead of dropping the connection.
+#[tokio::test]
+async fn tls_shutdown_answers_requests_in_progress_before_returning() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let pki = build_pki();
+    let (url, state, server) =
+        spawn_tls_task(tls_config(&pki, AuthMode::Disabled, false), AuthStore::disabled()).await;
+
+    let body = wire_encode(&SetupRequest::encode::<G1Affine, G2Affine>(&[], &[], &[], &[], &[]).unwrap())
+        .unwrap();
+    let head = format!(
+        "POST /v1/setup HTTP/1.1\r\nHost: localhost\r\n{VERSION_HEADER}: {PROTOCOL_VERSION}\r\n\
+         Content-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut conn = raw_tls(&pki, &url).await;
+    conn.write_all(head.as_bytes()).await.unwrap();
+    conn.write_all(&body[..10]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    state.shutting_down.store(true, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(!server.is_finished(), "serve_tls returned with a request in progress");
+
+    conn.write_all(&body[10..]).await.unwrap();
+    let mut buf = vec![0u8; 1024];
+    let n = conn.read(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf[..n]);
+    assert!(text.starts_with("HTTP/1.1 503"), "got: {text}");
+    assert!(text.contains("shutting_down"), "got: {text}");
+
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("serve_tls must return once the last connection closes");
+    result.unwrap().unwrap();
 }

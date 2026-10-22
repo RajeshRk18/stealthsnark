@@ -82,6 +82,7 @@ hyper = { version = "1", features = ["http1", "http2", "server"], optional = tru
 hyper-util = { version = "0.1", features = [
     "server",
     "server-auto",
+    "server-graceful",
     "tokio",
 ], optional = true }
 tower = { version = "0.5", features = ["util"], optional = true }

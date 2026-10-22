@@ -683,9 +683,11 @@ Owning the loop means owning what `axum::serve` did for free:
 
 | Responsibility | Implementation |
 |---|---|
-| graceful shutdown | `AtomicBool` polled in a `select!` against `accept()` |
+| graceful shutdown | `AtomicBool` polled in a `select!` against `accept()`; then `GracefulShutdown` tells each connection to finish its requests and close, and `serve_tls` waits up to `request_timeout` for them |
 | connection cap | 1024-permit semaphore; unbounded half-open handshakes are a memory exhaustion path |
 | handshake timeout | 15 s; without it a client that opens a socket and sends nothing holds a slot for ever |
+| header read timeout | `header_read_timeout`, 10 s; hyper applies it only when a timer is set, so the builder sets `TokioTimer`. Without it a client that sends header bytes slowly holds a slot for ever, before authentication runs |
+| HTTP/2 streams | 8 concurrent streams per connection (hyper default 200), keep-alive ping every 30 s |
 | ALPN | `alpn_protocols = ["h2", "http/1.1"]`, or you get HTTP/1.1 only |
 
 TLS sits behind a default-on `tls` feature so the lean core stays buildable under
