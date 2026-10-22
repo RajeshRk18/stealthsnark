@@ -41,7 +41,7 @@ It prints the record to add to the auth file:
 {
   "tiers": {
     "standard": {"max_sessions": 4, "max_body_bytes": 268435456,
-                 "requests_per_sec": 2.0, "burst": 10}
+                 "requests_per_sec": 2.0, "burst": 10, "max_inflight": 2}
   },
   "principals": [
     {"id": "alice", "tier": "standard",
@@ -61,6 +61,7 @@ caller's tier in the auth file.
 |---|---|
 | `requests_per_sec` + `burst` | One client flooding the service. Token bucket, so a legitimate burst is absorbed but the sustained rate binds. `429` + `Retry-After`. |
 | `max_sessions` | One client pinning all the memory. `429`. |
+| `max_inflight` | One client holding every MSM and upload slot. Optional, default `2`. `429` with code `inflight_limit`. |
 | `max_body_bytes` | One client uploading more than its plan allows. Checked from `Content-Length` before the body is read, so an over-quota upload is refused rather than buffered then discarded. `413`. |
 
 A session ends on whichever comes first, applied by a sweeper that runs with or

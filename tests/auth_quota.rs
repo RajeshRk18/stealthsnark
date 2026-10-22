@@ -547,3 +547,41 @@ async fn a_client_without_a_key_is_refused_clearly() {
     assert!(text.contains("401"), "got: {text}");
     assert!(text.contains("unauthenticated"), "got: {text}");
 }
+
+/// One principal cannot hold every slot: with `max_inflight = 1`, its second
+/// request while the first is in progress is refused, and another principal is
+/// still served.
+#[tokio::test]
+async fn one_principal_cannot_hold_more_than_its_inflight_slots() {
+    use tokio::io::AsyncWriteExt;
+
+    let mut tiers = tier("solo", 8, 64 * 1024 * 1024, 1000.0, 1000);
+    tiers.get_mut("solo").unwrap().max_inflight = 1;
+    let (auth, keys) = auth_store_with_keys(&["alice", "bob"], Some("solo"), tiers, AuthMode::ApiKey);
+    let (url, _state) = spawn_with_auth(ServerConfig::default(), auth).await;
+    let addr = url.trim_start_matches("http://");
+
+    // Alice starts an upload and does not finish it.
+    let mut slow = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let head = format!(
+        "POST /v1/setup HTTP/1.1\r\nHost: {addr}\r\n{VERSION_HEADER}: {PROTOCOL_VERSION}\r\n\
+         Authorization: Bearer {}\r\nContent-Type: application/octet-stream\r\n\
+         Content-Length: 1000\r\n\r\n",
+        keys[0].key
+    );
+    slow.write_all(head.as_bytes()).await.unwrap();
+    slow.write_all(&[0u8; 10]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let resp = setup_as(&url, Some(&keys[0].key), generators_body(4, 41)).await;
+    assert_eq!(resp.status().as_u16(), 429);
+    assert_eq!(error_code(resp).await, "inflight_limit");
+
+    let resp = setup_as(&url, Some(&keys[1].key), generators_body(4, 42)).await;
+    assert_eq!(resp.status().as_u16(), 200, "bob must not be blocked by alice");
+
+    drop(slow);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let resp = setup_as(&url, Some(&keys[0].key), generators_body(4, 43)).await;
+    assert_eq!(resp.status().as_u16(), 200, "alice's slot is free once her upload ends");
+}

@@ -89,6 +89,10 @@ pub struct Tier {
     pub name: String,
     /// Concurrent sessions this principal may hold.
     pub max_sessions: usize,
+    /// Setup and prove requests this principal may have in progress at once.
+    /// The global MSM slots are shared, so without this one principal can hold
+    /// all of them.
+    pub max_inflight: usize,
     /// Largest request body this principal may upload.
     pub max_body_bytes: usize,
     /// Sustained request rate, requests per second.
@@ -103,6 +107,7 @@ impl Tier {
         Self {
             name: "default".to_string(),
             max_sessions: 4,
+            max_inflight: DEFAULT_MAX_INFLIGHT,
             max_body_bytes: super::config::DEFAULT_MAX_BODY_BYTES,
             requests_per_sec: 2.0,
             burst: 10,
@@ -124,6 +129,7 @@ impl Tier {
         Self {
             name: "unlimited".to_string(),
             max_sessions: usize::MAX,
+            max_inflight: usize::MAX,
             max_body_bytes: usize::MAX,
             requests_per_sec: f64::from(u32::MAX),
             burst: u32::MAX,
@@ -249,11 +255,15 @@ impl AuthStore {
             if t.max_body_bytes == 0 {
                 anyhow::bail!("tier {name:?}: max_body_bytes must be >= 1");
             }
+            if t.max_inflight == 0 {
+                anyhow::bail!("tier {name:?}: max_inflight must be >= 1");
+            }
             tiers.insert(
                 name.clone(),
                 Tier {
                     name,
                     max_sessions: t.max_sessions,
+                    max_inflight: t.max_inflight,
                     max_body_bytes: t.max_body_bytes,
                     requests_per_sec: t.requests_per_sec,
                     burst: t.burst,
@@ -443,6 +453,17 @@ pub struct TierSpec {
     pub max_body_bytes: usize,
     pub requests_per_sec: f64,
     pub burst: u32,
+    /// Optional, so auth files written before this field still load.
+    #[serde(default = "default_max_inflight")]
+    pub max_inflight: usize,
+}
+
+/// Setup or prove requests one principal may have in progress, unless its tier
+/// says otherwise.
+pub const DEFAULT_MAX_INFLIGHT: usize = 2;
+
+fn default_max_inflight() -> usize {
+    DEFAULT_MAX_INFLIGHT
 }
 
 #[derive(Debug, Deserialize)]
@@ -713,6 +734,7 @@ mod tests {
                 max_body_bytes: 1024,
                 requests_per_sec: 1.0,
                 burst: 1,
+                max_inflight: 2,
             },
         );
         tiers.insert(
@@ -722,6 +744,7 @@ mod tests {
                 max_body_bytes: 8192,
                 requests_per_sec: 50.0,
                 burst: 100,
+                max_inflight: 2,
             },
         );
         let generated = generate_api_key();

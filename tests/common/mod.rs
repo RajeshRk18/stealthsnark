@@ -103,6 +103,7 @@ pub fn tier(
             max_body_bytes,
             requests_per_sec,
             burst,
+            max_inflight: 1000,
         },
     );
     t

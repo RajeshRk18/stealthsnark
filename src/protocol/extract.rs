@@ -24,6 +24,7 @@ use axum::body::Bytes;
 use tokio::sync::OwnedSemaphorePermit;
 
 use super::auth::Principal;
+use super::quota::InflightGuard;
 use super::error::ApiError;
 use super::messages::{PROTOCOL_VERSION, SESSION_HEADER, VERSION_HEADER};
 use super::server::AppState;
@@ -43,10 +44,17 @@ pub struct Caller(pub Arc<Principal>);
 /// or HTTP/2 sender that declares no length. This reads the body itself and
 /// stops at `min(tier, transport)`
 ///
-/// It takes an upload slot before it reads, so body memory is bounded by
-/// `max_concurrent_uploads`, not by the number of connections. Hold the permit
-/// for as long as the body is alive.
-pub struct TieredBody(pub Bytes, pub OwnedSemaphorePermit);
+/// Before it reads, it starts one of the caller's in-flight requests (tier
+/// `max_inflight`) and takes an upload slot, so body memory is bounded by
+/// `max_concurrent_uploads` and one caller cannot hold every slot. Keep the
+/// [`Held`] value for as long as the body is alive.
+pub struct TieredBody(pub Bytes, pub Held);
+
+/// The caller's in-flight slot and the upload slot, released on drop.
+pub struct Held {
+    _inflight: InflightGuard,
+    _upload: OwnedSemaphorePermit,
+}
 
 impl FromRequest<AppState> for TieredBody {
     type Rejection = ApiError;
@@ -55,6 +63,7 @@ impl FromRequest<AppState> for TieredBody {
         let (mut parts, body) = req.into_parts();
         let Caller(principal) = Caller::from_request_parts(&mut parts, app).await?;
         let limit = principal.tier.max_body_bytes.min(app.config.max_body_bytes);
+        let inflight = app.quota.enter(&principal).map_err(|e| app.reject(e))?;
         let upload = app
             .acquire_slot(&app.upload_slots)
             .await
@@ -65,7 +74,13 @@ impl FromRequest<AppState> for TieredBody {
                 limit_bytes: limit as u64,
             })
         })?;
-        Ok(TieredBody(bytes, upload))
+        Ok(TieredBody(
+            bytes,
+            Held {
+                _inflight: inflight,
+                _upload: upload,
+            },
+        ))
     }
 }
 

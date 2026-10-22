@@ -512,9 +512,19 @@ over-quota upload is refused rather than buffered and then discarded. For a
 Counted live by walking the map, excluding entries that are expired but not yet
 swept, so a principal is not charged for allowance it no longer holds.
 
+### 9.4 Requests in progress
+
+The MSM and upload slots are shared by all principals, and the rate limit counts
+requests, not the time they take. A prove takes seconds, so one principal at 2
+requests per second could keep every slot full. `TieredBody` therefore calls
+`QuotaEnforcer::enter` before it takes an upload slot. The tier's `max_inflight`
+(default 2) caps the setup and prove requests one principal has in progress. The
+guard lives with the body and decrements on drop, so the slot is free when the
+MSMs finish. A refusal is `inflight_limit`, 429, `Retry-After: 1`.
+
 ## 10. Error model
 
-`ApiError` has 14 variants, each with a stable machine code. Wire shape is
+`ApiError` has 15 variants, each with a stable machine code. Wire shape is
 `{"code": "...", "message": "..."}`.
 
 | Code | Status | Retryable |
@@ -529,6 +539,7 @@ swept, so a principal is not charged for allowance it no longer holds.
 | `body_too_large` | 413 | no |
 | `rate_limited` | 429 | yes |
 | `session_quota_exceeded` | 429 | yes |
+| `inflight_limit` | 429 | yes |
 | `session_limit` | 429 | yes |
 | `overloaded` | 503 | yes |
 | `shutting_down` | 503 | yes |

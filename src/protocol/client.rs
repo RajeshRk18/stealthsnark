@@ -342,6 +342,7 @@ pub fn classify(code: &str) -> Option<&'static str> {
         "forbidden" => "permission_error",
         "session_limit"
         | "session_quota_exceeded"
+        | "inflight_limit"
         | "rate_limited"
         | "overloaded"
         | "shutting_down" => "transient",

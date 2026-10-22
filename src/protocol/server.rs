@@ -544,7 +544,7 @@ async fn handle_setup(
     State(app): State<AppState>,
     _version: ApiVersion,
     Caller(principal): Caller,
-    TieredBody(body, upload): TieredBody,
+    TieredBody(body, slots): TieredBody,
 ) -> Result<Bytes, ApiError> {
     // Charge the session quota before decoding, so an over-quota caller does not
     // get megabytes of point validation done for free. `insert_within` checks
@@ -563,7 +563,7 @@ async fn handle_setup(
 
     let started = Instant::now();
     let decoded = tokio::task::spawn_blocking(move || {
-        let _permits = (permit, upload);
+        let _permits = (permit, slots);
         decode_generators(&body)
     })
     .await
@@ -618,7 +618,7 @@ async fn handle_prove(
     _version: ApiVersion,
     Caller(principal): Caller,
     owned: OwnedSession,
-    TieredBody(body, upload): TieredBody,
+    TieredBody(body, slots): TieredBody,
 ) -> Result<Bytes, ApiError> {
     let permit = app.acquire_msm_slot().await.map_err(|e| {
         app.metrics.prove_err.fetch_add(1, Ordering::Relaxed);
@@ -630,7 +630,7 @@ async fn handle_prove(
     let started = Instant::now();
 
     let computed = tokio::task::spawn_blocking(move || {
-        let _permits = (permit, upload); // released when the MSMs finish
+        let _permits = (permit, slots); // released when the MSMs finish
         evaluate_msms(&session, &body)
     })
     .await

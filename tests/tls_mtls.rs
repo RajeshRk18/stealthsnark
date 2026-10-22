@@ -123,6 +123,7 @@ fn roomy_tier() -> HashMap<String, TierSpec> {
             max_body_bytes: 64 * 1024 * 1024,
             requests_per_sec: 1000.0,
             burst: 1000,
+            max_inflight: 1000,
         },
     );
     t

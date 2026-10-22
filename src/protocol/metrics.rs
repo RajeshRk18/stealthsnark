@@ -65,7 +65,7 @@ impl Metrics {
             E::UnknownSession | E::MissingToken => &self.rejected_unknown_session,
             E::Unauthenticated(_) => &self.rejected_unauthenticated,
             E::Forbidden(_) => &self.rejected_forbidden,
-            E::RateLimited { .. } => &self.rejected_rate_limited,
+            E::RateLimited { .. } | E::InflightLimit { .. } => &self.rejected_rate_limited,
             E::BodyTooLarge { .. } => &self.rejected_body_too_large,
             _ => return,
         }
