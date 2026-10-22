@@ -185,11 +185,25 @@ impl SessionStore {
         self.epoch.elapsed().as_millis() as u64
     }
 
-    /// Store generators and return `(token, label)`.
+    #[cfg(test)]
     pub fn insert(
         &self,
         owner: &str,
         generators: Generators,
+    ) -> Result<(String, String), ApiError> {
+        self.insert_within(owner, generators, usize::MAX)
+    }
+
+    /// Store generators for `owner` and return `(token, label)`, if `owner` holds
+    /// fewer than `owner_limit` live sessions.
+    ///
+    /// Both limits are checked under the write lock. A check before the slow
+    /// decode alone lets concurrent setups from one principal all pass it.
+    pub fn insert_within(
+        &self,
+        owner: &str,
+        generators: Generators,
+        owner_limit: usize,
     ) -> Result<(String, String), ApiError> {
         self.sweep();
 
@@ -208,6 +222,13 @@ impl SessionStore {
         });
 
         let mut map = self.write();
+        let held = map
+            .values()
+            .filter(|s| s.owner == owner && !self.is_expired(s, now))
+            .count();
+        if held >= owner_limit {
+            return Err(ApiError::SessionQuotaExceeded { limit: owner_limit });
+        }
         if map.len() >= self.max_sessions {
             return Err(ApiError::SessionLimit);
         }
@@ -646,4 +667,29 @@ mod tests {
         s.insert("owner", g).unwrap();
         assert_eq!(s.resident_bytes(), expected);
     }
+
+    #[test]
+    fn concurrent_inserts_cannot_exceed_the_owner_limit() {
+        let s = Arc::new(store(64, 60_000));
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (s, start) = (s.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    s.insert_within("alice", tiny_generators(), 3)
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 3);
+        for e in results.iter().filter_map(|r| r.as_ref().err()) {
+            assert_eq!(e.code(), "session_quota_exceeded");
+        }
+        assert_eq!(s.count_for("alice"), 3);
+        // Another principal is not charged for alice's sessions.
+        assert!(s.insert_within("bob", tiny_generators(), 1).is_ok());
+    }
+
 }

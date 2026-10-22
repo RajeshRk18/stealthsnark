@@ -363,6 +363,10 @@ if map.len() >= self.max_sessions { return Err(ApiError::SessionLimit); }
 Without that, a map full of abandoned sessions would reject a legitimate new one
 even though every entry in it was already dead.
 
+The per-principal allowance is checked under the same write lock. `/v1/setup`
+also checks it before the decode, as a fast refusal, but that check alone lets
+concurrent setups from one principal all pass.
+
 `SessionLimit` (process-wide) and `SessionQuotaExceeded` (per-principal) are
 distinct errors sharing status 429. The first says the host is full, the second
 says one client is.

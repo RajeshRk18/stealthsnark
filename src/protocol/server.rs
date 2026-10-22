@@ -533,7 +533,8 @@ async fn handle_setup(
     TieredBody(body): TieredBody,
 ) -> Result<Bytes, ApiError> {
     // Charge the session quota before decoding, so an over-quota caller does not
-    // get megabytes of point validation done for free.
+    // get megabytes of point validation done for free. `insert_within` checks
+    // again under the lock, because concurrent setups all pass this check.
     let held = app.sessions.count_for(&principal.id);
     if let Err(e) = app.quota.check_session_allowance(&principal, held) {
         app.metrics.setup_err.fetch_add(1, Ordering::Relaxed);
@@ -565,7 +566,10 @@ async fn handle_setup(
     let counts = generators.counts();
     let resident = generators.resident_bytes();
 
-    let (token, label) = match app.sessions.insert(&principal.id, generators) {
+    let (token, label) = match app
+        .sessions
+        .insert_within(&principal.id, generators, principal.tier.max_sessions)
+    {
         Ok(pair) => pair,
         Err(e) => {
             app.metrics.setup_err.fetch_add(1, Ordering::Relaxed);
