@@ -51,7 +51,6 @@ use axum::Router;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
-use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use super::auth::AuthStore;
@@ -200,16 +199,31 @@ fn with_common_layers<S>(router: Router<S>, cfg: &ServerConfig) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
+    let limit = cfg.request_timeout;
     router
         .layer(CatchPanicLayer::new())
-        // send 503 on a timed-out MSM. 
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::SERVICE_UNAVAILABLE,
-            cfg.request_timeout,
-        ))
+        .layer(axum::middleware::from_fn(move |req, next| {
+            request_timeout(limit, req, next)
+        }))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(TraceLayer::new_for_http())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+}
+
+/// End a request that runs longer than `limit` with `timeout` (504).
+///
+/// Not retryable: the MSM in `spawn_blocking` keeps running and keeps its slot
+/// after the response is gone, so an immediate retry only queues the same work
+/// a second time.
+async fn request_timeout(
+    limit: std::time::Duration,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    match tokio::time::timeout(limit, next.run(req)).await {
+        Ok(resp) => resp,
+        Err(_) => ApiError::Timeout.into_response(),
+    }
 }
 
 pub async fn serve(state: AppState) -> anyhow::Result<()> {

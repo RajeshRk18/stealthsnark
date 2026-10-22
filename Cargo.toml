@@ -61,7 +61,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "charset",
     "rustls-tls",
 ] }
-tower-http = { version = "0.6", features = ["trace", "timeout", "request-id", "catch-panic"] }
+tower-http = { version = "0.6", features = ["trace", "request-id", "catch-panic"] }
 
 
 rustls = { version = "0.23", default-features = false, features = [

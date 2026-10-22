@@ -151,7 +151,7 @@ request
   ├─ SetRequestId          assign x-request-id (uuid)
   ├─ Trace                 open a span; later log lines carry the id
   ├─ PropagateRequestId    on the way out, copy the id onto the response
-  ├─ Timeout               request_timeout, 503 on expiry
+  ├─ request_timeout       504 `timeout` on expiry
   ├─ CatchPanic            innermost shared layer
   │
   ├─ DefaultBodyLimit      max_body_bytes            ┐ data plane only
@@ -173,9 +173,11 @@ realistically originate. One bad request becomes one 500 instead of a dead
 process. A panic in `Trace` would not be caught, which is acceptable: those layers
 do not touch untrusted data.
 
-The timeout returns 503, not the default 408. A timed-out MSM is the server
-failing to finish, which is a server condition and retryable. 408 would blame the
-client.
+The timeout returns 504 with code `timeout`, not retryable. It is a server
+condition, so not 408, which would blame the client. It is not 503 either: the
+response is gone, but the MSM in `spawn_blocking` keeps running and keeps its
+slot, so a client that retries at once only queues the same work a second time.
+Set `STEALTHSNARK_REQUEST_TIMEOUT_SECS` above the slowest MSM you serve.
 
 ### 5.2 Authentication runs before routing
 
@@ -524,7 +526,7 @@ MSMs finish. A refusal is `inflight_limit`, 429, `Retry-After: 1`.
 
 ## 10. Error model
 
-`ApiError` has 15 variants, each with a stable machine code. Wire shape is
+`ApiError` has 16 variants, each with a stable machine code. Wire shape is
 `{"code": "...", "message": "..."}`.
 
 | Code | Status | Retryable |
@@ -543,6 +545,7 @@ MSMs finish. A refusal is `inflight_limit`, 429, `Retry-After: 1`.
 | `session_limit` | 429 | yes |
 | `overloaded` | 503 | yes |
 | `shutting_down` | 503 | yes |
+| `timeout` | 504 | no |
 | `internal` | 500 | no |
 
 Four rules behind the table:

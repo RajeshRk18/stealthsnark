@@ -60,6 +60,10 @@ pub enum ApiError {
     #[error("server is shutting down")]
     ShuttingDown,
 
+    /// The request ran longer than `STEALTHSNARK_REQUEST_TIMEOUT_SECS`.
+    #[error("request timed out; the server may still be computing it, do not retry at once")]
+    Timeout,
+
     /// The detail is logged server-side and never sent to the caller.
     #[error("internal server error")]
     Internal(String),
@@ -84,6 +88,7 @@ impl ApiError {
             Self::SessionLimit => "session_limit",
             Self::Overloaded => "overloaded",
             Self::ShuttingDown => "shutting_down",
+            Self::Timeout => "timeout",
             Self::Internal(_) => "internal",
         }
     }
@@ -107,6 +112,7 @@ impl ApiError {
             | Self::SessionQuotaExceeded { .. }
             | Self::InflightLimit { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::Overloaded | Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -196,6 +202,7 @@ pub(crate) mod tests {
             ApiError::SessionLimit,
             ApiError::Overloaded,
             ApiError::ShuttingDown,
+            ApiError::Timeout,
             ApiError::Internal(String::new()),
         ]
     }

@@ -526,3 +526,35 @@ async fn bodies_are_not_read_without_an_upload_slot() {
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(state.upload_slots.available_permits(), 1);
 }
+
+/// A request over `request_timeout` gets `timeout` (504), which is not retryable,
+/// because the work it started may still be running.
+#[tokio::test]
+async fn a_timed_out_request_is_a_504_that_is_not_retryable() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (url, _state) = spawn_server_with(ServerConfig {
+        request_timeout: Duration::from_millis(200),
+        ..ServerConfig::default()
+    })
+    .await;
+    let addr = url.trim_start_matches("http://");
+
+    let mut slow = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let head = format!(
+        "POST /v1/setup HTTP/1.1\r\nHost: {addr}\r\n{VERSION_HEADER}: {PROTOCOL_VERSION}\r\n\
+         Content-Type: application/octet-stream\r\nContent-Length: 1000\r\n\r\n"
+    );
+    slow.write_all(head.as_bytes()).await.unwrap();
+    slow.write_all(&[0u8; 10]).await.unwrap();
+
+    let mut buf = vec![0u8; 1024];
+    let n = tokio::time::timeout(Duration::from_secs(5), slow.read(&mut buf))
+        .await
+        .expect("the server must answer within the timeout")
+        .unwrap();
+    let text = String::from_utf8_lossy(&buf[..n]);
+    assert!(text.starts_with("HTTP/1.1 504"), "got: {text}");
+    assert!(text.contains(r#""code":"timeout""#), "got: {text}");
+    assert!(!text.to_ascii_lowercase().contains("retry-after"), "got: {text}");
+}

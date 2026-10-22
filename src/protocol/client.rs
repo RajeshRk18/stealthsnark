@@ -346,7 +346,7 @@ pub fn classify(code: &str) -> Option<&'static str> {
         | "rate_limited"
         | "overloaded"
         | "shutting_down" => "transient",
-        "internal" => "server_error",
+        "internal" | "timeout" => "server_error",
         _ => return None,
     })
 }
