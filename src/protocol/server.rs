@@ -208,6 +208,14 @@ where
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(TraceLayer::new_for_http())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+        // `SetRequestId` keeps an id the client sent, so a client could put a
+        // chosen or duplicate id in the server logs. Drop it first.
+        .layer(axum::middleware::map_request(
+            |mut req: axum::extract::Request| async move {
+                req.headers_mut().remove("x-request-id");
+                req
+            },
+        ))
 }
 
 /// End a request that runs longer than `limit` with `timeout` (504).

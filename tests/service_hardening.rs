@@ -554,3 +554,21 @@ async fn a_timed_out_request_is_a_504_that_is_not_retryable() {
     assert!(text.contains(r#""code":"timeout""#), "got: {text}");
     assert!(!text.to_ascii_lowercase().contains("retry-after"), "got: {text}");
 }
+
+/// The server always makes its own request id, so a client cannot choose the id
+/// that appears in the server logs.
+#[tokio::test]
+async fn a_client_request_id_is_replaced() {
+    let (url, _state) = spawn_server().await;
+    let resp = client()
+        .post(format!("{url}/v1/setup"))
+        .header(VERSION_HEADER, PROTOCOL_VERSION.to_string())
+        .header("x-request-id", "chosen-by-client")
+        .body(generators_body(2, 61))
+        .send()
+        .await
+        .unwrap();
+    let id = resp.headers().get("x-request-id").unwrap().to_str().unwrap();
+    assert_ne!(id, "chosen-by-client");
+    assert_eq!(id.len(), 36, "expected a server uuid, got {id}");
+}

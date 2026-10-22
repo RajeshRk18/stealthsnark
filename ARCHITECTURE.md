@@ -150,6 +150,7 @@ the layers bottom-up. This is the opposite of `ServiceBuilder` reading order.
 ```
 request
   │
+  ├─ strip x-request-id    drop an id the client sent
   ├─ SetRequestId          assign x-request-id (uuid)
   ├─ Trace                 open a span; later log lines carry the id
   ├─ PropagateRequestId    on the way out, copy the id onto the response
