@@ -17,6 +17,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+use rustls::pki_types::pem::PemObject;
 use std::time::Duration;
 
 use ark_bn254::{G1Affine, G1Projective as G1, G2Affine};
@@ -537,7 +539,7 @@ fn cert_auth(digest: &str, id: &str, mode: AuthMode) -> AuthStore {
 /// A raw TLS connection to the test server, for requests reqwest cannot shape.
 async fn raw_tls(pki: &Pki, url: &str) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut pki.ca_pem.as_bytes()) {
+    for cert in rustls::pki_types::CertificateDer::pem_slice_iter(pki.ca_pem.as_bytes()) {
         roots.add(cert.unwrap()).unwrap();
     }
     let config = rustls::ClientConfig::builder()
@@ -620,7 +622,7 @@ async fn a_tls12_only_client_is_refused() {
     let (url, _state) = spawn_tls(tls_config(&pki, AuthMode::Disabled, false), AuthStore::disabled()).await;
 
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut pki.ca_pem.as_bytes()) {
+    for cert in rustls::pki_types::CertificateDer::pem_slice_iter(pki.ca_pem.as_bytes()) {
         roots.add(cert.unwrap()).unwrap();
     }
     let config = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])

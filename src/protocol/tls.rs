@@ -21,10 +21,10 @@
 //! configured client CA first. The digest only maps an already-verified
 //! certificate to a principal.
 
-use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig as RustlsServerConfig};
@@ -125,8 +125,7 @@ pub fn peer_digest(conn: &rustls::ServerConnection) -> Option<String> {
 fn load_certs(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
     let data = std::fs::read(path)
         .map_err(|e| anyhow::anyhow!("cannot read certificate file {}: {e}", path.display()))?;
-    let mut reader = io::BufReader::new(&data[..]);
-    rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_slice_iter(&data)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("cannot parse certificates in {}: {e}", path.display()))
 }
@@ -146,24 +145,15 @@ fn key_file_is_exposed(_path: &Path) -> bool {
 fn load_private_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
     let data = std::fs::read(path)
         .map_err(|e| anyhow::anyhow!("cannot read key file {}: {e}", path.display()))?;
-    let mut reader = io::BufReader::new(&data[..]);
-
-    // Accept any of the three encodings a key is plausibly delivered in, rather
-    // than making an operator convert the file.
-    while let Some(item) = rustls_pemfile::read_one(&mut reader)
-        .map_err(|e| anyhow::anyhow!("cannot parse key file {}: {e}", path.display()))?
-    {
-        match item {
-            rustls_pemfile::Item::Pkcs8Key(k) => return Ok(PrivateKeyDer::Pkcs8(k)),
-            rustls_pemfile::Item::Pkcs1Key(k) => return Ok(PrivateKeyDer::Pkcs1(k)),
-            rustls_pemfile::Item::Sec1Key(k) => return Ok(PrivateKeyDer::Sec1(k)),
-            _ => continue,
-        }
-    }
-    anyhow::bail!(
-        "no PKCS#8, PKCS#1, or SEC1 private key found in {}",
-        path.display()
-    )
+    // Accepts PKCS#8, PKCS#1 and SEC1, the three encodings a key is plausibly
+    // delivered in, rather than making an operator convert the file.
+    PrivateKeyDer::from_pem_slice(&data).map_err(|e| match e {
+        rustls::pki_types::pem::Error::NoItemsFound => anyhow::anyhow!(
+            "no PKCS#8, PKCS#1, or SEC1 private key found in {}",
+            path.display()
+        ),
+        e => anyhow::anyhow!("cannot parse key file {}: {e}", path.display()),
+    })
 }
 
 #[cfg(test)]
