@@ -59,6 +59,12 @@ pub fn server_config(
         anyhow::bail!("no certificates found in {}", paths.cert.display());
     }
     let key = load_private_key(&paths.key)?;
+    if key_file_is_exposed(&paths.key) {
+        tracing::warn!(
+            path = %paths.key.display(),
+            "the TLS private key file is readable by group or other users; run chmod 600 on it"
+        );
+    }
 
     let builder = match &paths.client_ca {
         Some(ca_path) => {
@@ -123,6 +129,18 @@ fn load_certs(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
     rustls_pemfile::certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("cannot parse certificates in {}: {e}", path.display()))
+}
+
+/// Whether group or other users have any permission on the file.
+#[cfg(unix)]
+fn key_file_is_exposed(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0)
+}
+
+#[cfg(not(unix))]
+fn key_file_is_exposed(_path: &Path) -> bool {
+    false
 }
 
 fn load_private_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
@@ -286,4 +304,20 @@ mod tests {
         let server = load_certs(&pki.dir.join("server.pem")).unwrap();
         assert_ne!(cert_digest(&client[0]), cert_digest(&server[0]));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_key_file_open_to_group_or_others_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("stealthsnark-key-{}", crate::protocol::secret::random_hex(6)));
+        std::fs::write(&path, b"key").unwrap();
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(key_file_is_exposed(&path));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!key_file_is_exposed(&path));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
 }
