@@ -460,7 +460,19 @@ Digest identity also avoids parsing X.509 subject names, which would be attack
 surface for no benefit. The cost is that a renewed certificate is a new identity
 and must be re-registered.
 
-### 8.3 The anonymous principal
+### 8.3 Revocation
+
+`SIGHUP` reloads the auth file. `AppState::reload_auth` parses the new file, swaps
+the whole store behind an `RwLock<Arc<AuthStore>>`, and releases the sessions of
+each principal that is no longer in the file. Each request authenticates again, so
+a removed key or certificate fails on its next request, also on an open mTLS
+connection. A file that does not parse is logged at `error` and the current store
+stays in force: a typo must not lock out every client.
+
+Before this, revocation needed a restart, which also dropped every session and,
+with TLS, the proofs in progress. That gave an operator a reason to wait.
+
+### 8.4 The anonymous principal
 
 With `STEALTHSNARK_AUTH=disabled` every caller is `anonymous` on
 `Tier::unlimited()`. The reasoning is worth recording because the first version

@@ -215,15 +215,16 @@ impl AuthStore {
     }
 
     pub fn principal_count(&self) -> usize {
-        let mut ids: Vec<&str> = self
-            .by_key_id
+        self.principal_ids().len()
+    }
+
+    /// Every principal that has at least one credential.
+    pub fn principal_ids(&self) -> std::collections::BTreeSet<&str> {
+        self.by_key_id
             .values()
             .chain(self.by_cert_digest.values())
             .map(|r| r.principal_id.as_str())
-            .collect();
-        ids.sort_unstable();
-        ids.dedup();
-        ids.len()
+            .collect()
     }
 
     pub fn api_key_count(&self) -> usize {

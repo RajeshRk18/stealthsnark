@@ -181,7 +181,7 @@ Throughput is flat across the bounds while per request increases. This may be be
 ## Limitations and future TODOs
 
 - Certificate identity is pinned by digest. mTLS identifies a client by the SHA-256 of its certificate, so a renewed certificate is a new identity and must be re-registered.
-- API keys live forever. Removing a record from the auth file revokes a key but it needs a restart. There is no online revocation and no expiry.
+- API keys have no expiry. To revoke a key, remove its record from the auth file and send `SIGHUP`; the server reloads the file without a restart.
 - Currently, user's quota is per process. Rate-limit and session counts live in memory, so it is fine for a single-server instance we have now. This can be a todo to demonstrate shared state in a distributed architecture if we implement multiple servers or clusters support.
 - Session token lookup is not constant-time.
 - Resource exhaustion is within the configured limits. Currently, server admits only `STEALTHSNARK_MAX_CONCURRENT_MSM` MSMs of up to `STEALTHSNARK_MAX_BODY_BYTES` each as we dont want the server to Dos attacked.

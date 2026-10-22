@@ -37,7 +37,7 @@
 //! only long enough to clone an `Arc<Session>`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use ark_bn254::{Fr, G1Affine, G1Projective as G1, G2Affine, G2Projective as G2};
@@ -66,7 +66,8 @@ use super::session::{Generators, Session, SessionStore};
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<ServerConfig>,
-    pub auth: Arc<AuthStore>,
+    /// Swapped as a whole on SIGHUP. Read it with [`AppState::auth`].
+    pub auth: Arc<RwLock<Arc<AuthStore>>>,
     pub quota: Arc<QuotaEnforcer>,
     pub sessions: Arc<SessionStore>,
     pub metrics: Arc<Metrics>,
@@ -98,7 +99,7 @@ impl AppState {
         let upload_slots = Arc::new(Semaphore::new(config.max_concurrent_uploads));
         Self {
             config: Arc::new(config),
-            auth: Arc::new(auth),
+            auth: Arc::new(RwLock::new(Arc::new(auth))),
             quota: Arc::new(QuotaEnforcer::new()),
             sessions,
             metrics: Arc::new(Metrics::default()),
@@ -106,6 +107,35 @@ impl AppState {
             upload_slots,
             shutting_down: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The credential store in force now.
+    pub fn auth(&self) -> Arc<AuthStore> {
+        self.auth.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Load the auth file again and swap it in, and return the principals that
+    /// are no longer in it. Their sessions are removed. A file that does not
+    /// load is an error, and the current store stays in force.
+    pub fn reload_auth(&self) -> anyhow::Result<Vec<String>> {
+        let path = self
+            .config
+            .auth_file
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no STEALTHSNARK_AUTH_FILE to reload"))?;
+        let new = AuthStore::from_file(path, self.config.auth_mode)?;
+        let removed: Vec<String> = self
+            .auth()
+            .principal_ids()
+            .difference(&new.principal_ids())
+            .map(|id| id.to_string())
+            .collect();
+
+        *self.auth.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(new);
+        for id in &removed {
+            self.sessions.remove_all_for(id);
+        }
+        Ok(removed)
     }
 
     /// Wait a bounded time for an MSM slot.
@@ -238,6 +268,8 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
     let cfg = state.config.clone();
 
     tokio::spawn(sweeper(state.clone()));
+    #[cfg(unix)]
+    tokio::spawn(reload_auth_on_sighup(state.clone()));
 
     let admin = tokio::net::TcpListener::bind(cfg.admin_bind_addr).await?;
     let admin_addr = admin.local_addr()?;
@@ -252,9 +284,9 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
             .as_ref()
             .map(|t| t.client_ca.is_some())
             .unwrap_or(false),
-        principals = state.auth.principal_count(),
-        api_keys = state.auth.api_key_count(),
-        client_certs = state.auth.client_cert_count(),
+        principals = state.auth().principal_count(),
+        api_keys = state.auth().api_key_count(),
+        client_certs = state.auth().client_cert_count(),
         max_body_mib = cfg.max_body_bytes / (1024 * 1024),
         max_sessions = cfg.max_sessions,
         max_resident_mib = cfg.max_resident_bytes / (1024 * 1024),
@@ -290,7 +322,7 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
 
     // A tier above the transport ceiling is not an error, but the operator should
     // know that the extra allowance can never be used.
-    let widest_tier = state.auth.max_body_bytes_over_tiers();
+    let widest_tier = state.auth().max_body_bytes_over_tiers();
     if widest_tier > cfg.max_body_bytes {
         tracing::warn!(
             tier_max_body_bytes = widest_tier,
@@ -524,6 +556,32 @@ async fn shutdown_signal(state: AppState) {
         active_sessions = state.sessions.len(),
         "shutdown signal received; draining in-flight requests"
     );
+}
+
+/// Reload the auth file on SIGHUP, so a key can be revoked without a restart.
+#[cfg(unix)]
+async fn reload_auth_on_sighup(state: AppState) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut hangup = match signal(SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot listen for SIGHUP; auth reload is off");
+            return;
+        }
+    };
+    while hangup.recv().await.is_some() {
+        match state.reload_auth() {
+            Ok(removed) => tracing::info!(
+                principals = state.auth().principal_count(),
+                ?removed,
+                "auth file reloaded; sessions of removed principals released"
+            ),
+            Err(e) => tracing::error!(
+                error = %e,
+                "auth file reload failed; the current credentials stay in force"
+            ),
+        }
+    }
 }
 
 /// Release generators held by abandoned sessions, and forget idle rate buckets.
@@ -903,4 +961,44 @@ mod tests {
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(handle_livez().await, StatusCode::OK);
     }
+
+    #[test]
+    fn reload_revokes_removed_principals_and_keeps_the_store_on_a_bad_file() {
+        use super::super::auth::{generate_api_key, AuthMode};
+        use super::super::session::Generators;
+
+        let path = std::env::temp_dir().join(format!("stealthsnark-auth-{}.json", crate::protocol::secret::random_hex(6)));
+        let (alice, bob) = (generate_api_key(), generate_api_key());
+        let record = |id: &str, k: &super::super::auth::GeneratedKey| {
+            serde_json::json!({"id": id, "api_key_id": k.key_id, "api_key_sha256": k.sha256})
+        };
+        let write = |principals: Vec<serde_json::Value>| {
+            std::fs::write(&path, serde_json::json!({ "principals": principals }).to_string()).unwrap()
+        };
+        write(vec![record("alice", &alice), record("bob", &bob)]);
+
+        let config = ServerConfig {
+            auth_mode: AuthMode::ApiKey,
+            auth_file: Some(path.clone()),
+            ..ServerConfig::default()
+        };
+        let app = AppState::with_auth(config, AuthStore::from_file(&path, AuthMode::ApiKey).unwrap());
+        let empty = || Generators::from_points(vec![], vec![], vec![], vec![], vec![]);
+        app.sessions.insert_within("alice", empty(), 4).unwrap();
+        app.sessions.insert_within("bob", empty(), 4).unwrap();
+
+        write(vec![record("bob", &bob)]);
+        assert_eq!(app.reload_auth().unwrap(), vec!["alice".to_string()]);
+        assert_eq!(app.auth().authenticate(Some(&alice.key), None).unwrap_err().code(), "unauthenticated");
+        assert_eq!(app.auth().authenticate(Some(&bob.key), None).unwrap().id, "bob");
+        assert_eq!(app.sessions.count_for("alice"), 0);
+        assert_eq!(app.sessions.count_for("bob"), 1);
+
+        std::fs::write(&path, "not json").unwrap();
+        assert!(app.reload_auth().is_err());
+        assert_eq!(app.auth().authenticate(Some(&bob.key), None).unwrap().id, "bob");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
 }

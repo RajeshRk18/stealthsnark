@@ -113,7 +113,7 @@ pub async fn authenticate(
     let presented_key = bearer_credential(request.headers());
 
     let principal = app
-        .auth
+        .auth()
         .authenticate(presented_key.as_deref(), cert_digest.as_deref())
         .map_err(|e| app.reject(e))?;
 

@@ -52,6 +52,11 @@ It prints the record to add to the auth file:
 }
 ```
 
+To add or revoke a credential, edit the file and send `SIGHUP` to the server
+(`kill -HUP <pid>`). The server loads the file again without a restart and
+releases the sessions of each principal that is no longer in it. If the new file
+does not parse, the server logs an error and keeps the current credentials.
+
 ## Limits
 
 Server-wide limits come from the environment. Per-client limits come from the
