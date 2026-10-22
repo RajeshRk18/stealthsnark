@@ -458,10 +458,8 @@ async fn sweeper(state: AppState) {
 
         let swept = state.sessions.sweep();
         if swept.total() > 0 {
-            state
-                .metrics
-                .sessions_evicted
-                .fetch_add(swept.total() as u64, Ordering::Relaxed);
+            // `/metrics` reads the eviction count from the store, so it is not
+            // counted here a second time.
             // Both reasons are logged, because an operator debugging a session
             // that vanished needs to know which limit ended it.
             tracing::info!(
