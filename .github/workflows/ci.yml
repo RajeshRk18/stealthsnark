@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Weekly, so a new advisory against an unchanged Cargo.lock still fails CI.
+  schedule:
+    - cron: "0 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  ci-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+      - name: Install circom
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -sSfL -o "$HOME/bin/circom" https://github.com/iden3/circom/releases/download/v2.2.3/circom-linux-amd64
+          chmod +x "$HOME/bin/circom"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: scripts/harness-check.sh ci-linux

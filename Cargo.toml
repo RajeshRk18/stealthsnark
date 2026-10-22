@@ -2,6 +2,7 @@
 name = "stealthsnark"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [lints.rust]
 # `kani` is set by the cargo-kani driver, not cargo. Declaring it here

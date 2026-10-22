@@ -118,6 +118,16 @@ Terminal 2, run the client:
 cargo run --bin client
 ```
 
+## Checks
+
+```sh
+scripts/harness-check.sh quick      # library unit tests, seconds
+scripts/harness-check.sh ci-linux   # what CI runs: build, all tests, fuzz crate, cargo deny
+```
+
+`ci-linux` needs `circom` 2.2.3 and `cargo-deny`. CI runs it on every push to `main`,
+on pull requests, and weekly for new advisories.
+
 ## Using your own circuit
 
 1. Write a `.circom` file and compile it (`circom circuit.circom --r1cs --wasm --sym -o build/`)

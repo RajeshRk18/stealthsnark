@@ -1,0 +1,48 @@
+# cargo-deny: advisories, licenses, banned crates and sources. Run by
+# `scripts/harness-check.sh ci-linux` and in CI.
+
+[graph]
+all-features = true
+
+[advisories]
+# Each ignore is transitive, has no fixed release on our dependency's version, and
+# is reviewed when that dependency is upgraded.
+ignore = [
+    # Through ark-circom -> wasmer (the `circom` feature, client side only).
+    { id = "RUSTSEC-2025-0141", reason = "bincode via wasmer-wasix; stealthsnark uses postcard" },
+    { id = "RUSTSEC-2026-0235", reason = "rkyv 0.7 via wasmer; stealthsnark does not load rkyv archives" },
+    { id = "RUSTSEC-2024-0388", reason = "derivative (unmaintained) via arkworks and wasmer" },
+    { id = "RUSTSEC-2025-0057", reason = "fxhash (unmaintained) via cranelift and wasmer" },
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error (unmaintained) via wasmer-derive" },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml (unmaintained) via wasmer-config" },
+    { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill (unmaintained) via heapless in wasmer-wasix" },
+    # Through arkworks 0.5.
+    { id = "RUSTSEC-2024-0436", reason = "paste (unmaintained) via ark-ff and ark-ec" },
+    { id = "RUSTSEC-2025-0055", reason = "tracing-subscriber 0.2 via ark-relations; the server logs through 0.3" },
+]
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
