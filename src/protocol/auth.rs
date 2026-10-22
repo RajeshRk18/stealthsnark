@@ -3,8 +3,8 @@
 //!
 //! A request carries two credentials used in different stage:
 //!
-//!     - API Key or TLS client certificate which is helpful to identify "who am i"
-//!     - Session token to identify the short lived session owned by that identity bearer(server identifies the user's generators sent via `/v1/setup`)
+//! - API Key or TLS client certificate which is helpful to identify "who am i"
+//! - Session token to identify the short lived session owned by that identity bearer(server identifies the user's generators sent via `/v1/setup`)
 //!
 //! The layers are deliberately separate. A session records the principal that
 //! created it, so a stolen session token is useless without that principal's
