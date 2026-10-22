@@ -5,7 +5,7 @@ Reference. For why any of it is shaped this way, see
 
 ## API
 
-Bodies are bincode over `application/octet-stream`. Errors are
+Bodies are postcard over `application/octet-stream`. Errors are
 `{"code": "...", "message": "..."}`, where `code` is stable and machine-readable.
 
 | Method | Path | Headers | Purpose |
@@ -17,7 +17,7 @@ Bodies are bincode over `application/octet-stream`. Errors are
 
 | Header | Value |
 |---|---|
-| `x-stealthsnark-version` | `2`, required on every `/v1` request |
+| `x-stealthsnark-version` | `3`, required on every `/v1` request |
 | `Authorization` | `Bearer <api key>`, omit under mTLS |
 | `x-stealthsnark-session` | the token returned by `/v1/setup` |
 
@@ -41,7 +41,7 @@ It prints the record to add to the auth file:
 {
   "tiers": {
     "standard": {"max_sessions": 4, "max_body_bytes": 268435456,
-                 "requests_per_sec": 2.0, "burst": 10}
+                 "requests_per_sec": 2.0, "burst": 10, "max_inflight": 2}
   },
   "principals": [
     {"id": "alice", "tier": "standard",
@@ -52,6 +52,11 @@ It prints the record to add to the auth file:
 }
 ```
 
+To add or revoke a credential, edit the file and send `SIGHUP` to the server
+(`kill -HUP <pid>`). The server loads the file again without a restart and
+releases the sessions of each principal that is no longer in it. If the new file
+does not parse, the server logs an error and keeps the current credentials.
+
 ## Limits
 
 Server-wide limits come from the environment. Per-client limits come from the
@@ -61,6 +66,7 @@ caller's tier in the auth file.
 |---|---|
 | `requests_per_sec` + `burst` | One client flooding the service. Token bucket, so a legitimate burst is absorbed but the sustained rate binds. `429` + `Retry-After`. |
 | `max_sessions` | One client pinning all the memory. `429`. |
+| `max_inflight` | One client holding every MSM and upload slot. Optional, default `2`. `429` with code `inflight_limit`. |
 | `max_body_bytes` | One client uploading more than its plan allows. Checked from `Content-Length` before the body is read, so an over-quota upload is refused rather than buffered then discarded. `413`. |
 
 A session ends on whichever comes first, applied by a sweeper that runs with or
@@ -96,6 +102,10 @@ openssl x509 -req -in client.csr -CA ca.pem -CAkey ca.key -out client.pem -days 
   -extfile <(printf "basicConstraints=CA:FALSE\nextendedKeyUsage=clientAuth")
   ```
 
+The server accepts TLS 1.3 only. Clients must support it: the demo client and
+any rustls or OpenSSL 1.1.1+ client do, but macOS `/usr/bin/curl`
+(SecureTransport) does not.
+
 Failed handshakes are logged at `warn`, with the rustls error text.
 
 The demo client reads its credentials from the environment:
@@ -112,12 +122,59 @@ STEALTHSNARK_CLIENT_IDENTITY=client-identity.pem
 TLS is behind the `tls` feature, on by default. With the feature off, a configured
 TLS path is a startup error, not a downgrade to plain HTTP.
 
+## Running under systemd
+
+The server holds untrusted data in memory and needs no privileges. Run it as its
+own user, with an OS memory limit as a second line behind
+`STEALTHSNARK_MAX_RESIDENT_BYTES` and `peak_body_mib`.
+
+```ini
+[Unit]
+Description=StealthSnark MSM server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=stealthsnark
+Group=stealthsnark
+EnvironmentFile=/etc/stealthsnark/env
+ExecStart=/usr/local/bin/stealthsnark-server
+# SIGHUP reloads the auth file.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+# Above STEALTHSNARK_MAX_RESIDENT_BYTES + peak_body_mib + about 1 GiB.
+MemoryMax=12G
+# The default 90 s would kill proofs that are still draining after SIGTERM.
+# Use STEALTHSNARK_REQUEST_TIMEOUT_SECS plus a margin.
+TimeoutStopSec=660
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+ReadOnlyPaths=/etc/stealthsnark
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Keep the TLS key and the auth file in `/etc/stealthsnark`, owned by the
+`stealthsnark` user, with mode `600`. The server warns at startup when the key
+file is readable by group or other users. A port below 1024 needs
+`AmbientCapabilities=CAP_NET_BIND_SERVICE`, and then `CapabilityBoundingSet`
+must include it too.
+
 ## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `STEALTHSNARK_BIND` | `127.0.0.1:3000` | Data-plane bind address. Loopback by default so an unauthenticated service is not exposed by accident. |
-| `STEALTHSNARK_ADMIN_BIND` | `127.0.0.1:3001` | Admin plane. Startup fails if this is not loopback. |
+| `STEALTHSNARK_ADMIN_BIND` | `127.0.0.1:3001` | Admin plane. A non-loopback address starts with a warning: the admin paths need no credential, so restrict the address with a firewall or network policy. |
 | `STEALTHSNARK_AUTH` | `disabled` | `disabled`, `apikey`, `mtls`, or `any`. |
 | `STEALTHSNARK_AUTH_FILE` | none | JSON credential file. Required unless auth is disabled. |
 | `STEALTHSNARK_TLS_CERT` / `_KEY` | none | Server certificate chain and private key. Must be set together. |
@@ -125,24 +182,28 @@ TLS path is a startup error, not a downgrade to plain HTTP.
 | `STEALTHSNARK_QUOTA_BUCKET_IDLE_SECS` | `600` | When an idle rate-limit bucket is forgotten. |
 | `STEALTHSNARK_MAX_BODY_BYTES` | `268435456` (256 MiB) | Largest request body. **This is what decides the largest servable circuit**, see below. |
 | `STEALTHSNARK_MAX_SESSIONS` | `64` | Cap on live sessions; each pins its generators in memory. |
+| `STEALTHSNARK_MAX_RESIDENT_BYTES` | `8589934592` (8 GiB) | Cap on generator bytes pinned by all sessions together. A setup above it gets `session_limit`. Set it below the host's memory. |
 | `STEALTHSNARK_SESSION_TTL_SECS` | `1800` | Idle timeout before a session is evicted. |
 | `STEALTHSNARK_SESSION_MAX_AGE_SECS` | `43200` (12 h) | Absolute session lifetime, however often it is used. Must be >= the idle timeout. |
 | `STEALTHSNARK_SWEEP_INTERVAL_SECS` | `60` | How often idle sessions are reclaimed. |
 | `STEALTHSNARK_MAX_CONCURRENT_MSM` | `cores/2`, clamped to `[1,4]` | Concurrent MSM evaluations. Small on purpose: each MSM is already rayon-parallel internally. |
+| `STEALTHSNARK_MAX_CONCURRENT_UPLOADS` | `2 * MAX_CONCURRENT_MSM` | Request bodies held in memory at once. A request waits for a slot before its body is read. Must be >= `MAX_CONCURRENT_MSM`. |
 | `STEALTHSNARK_ADMISSION_WAIT_SECS` | `30` | How long a request waits for a slot before a 503. |
-| `STEALTHSNARK_REQUEST_TIMEOUT_SECS` | `600` | Per-request ceiling. |
+| `STEALTHSNARK_HEADER_READ_TIMEOUT_SECS` | `10` | TLS listener: time a connection has to send complete request headers. |
+| `STEALTHSNARK_REQUEST_TIMEOUT_SECS` | `600` | Per-request ceiling. Set it above the slowest MSM: a timed-out request gets `504` with code `timeout`, not retryable, and its MSM still runs to the end. |
 | `STEALTHSNARK_LOG` | `info` | `tracing` filter. |
 | `STEALTHSNARK_LOG_FORMAT` | text | Set to `json` for structured logs. |
 | `STEALTHSNARK_SERVER_URL` | `http://127.0.0.1:3000` | Client binary only. |
 | `STEALTHSNARK_API_KEY` | none | Client binary only. |
 | `STEALTHSNARK_CA_CERT` | none | Client binary only: trust a private CA. |
 | `STEALTHSNARK_CLIENT_IDENTITY` | none | Client binary only: certificate and key in one PEM for mTLS. |
+| `STEALTHSNARK_MALICIOUS` | unset | Client binary only: `1` uses malicious-secure mode, which sends two `/v1/prove` calls per proof and detects a cheating server. |
 
 Server startup refuses these mis-configs:
 
 - authentication disabled on a non-loopback bind address.
 - authentication enabled with no auth file.
 - `mtls` without TLS
-- an admin bind that is not loopback, or equal to the data bind.
+- an admin bind that is the same socket as the data bind.
 - a TLS certificate without its key.
 - TLS configured in a binary built without the `tls` feature.

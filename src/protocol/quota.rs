@@ -8,7 +8,7 @@
 //! - **Concurrent sessions** — bounds how much memory one principal can pin.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use super::auth::Principal;
@@ -52,6 +52,28 @@ impl Bucket {
 #[derive(Debug)]
 pub struct QuotaEnforcer {
     buckets: RwLock<HashMap<String, Bucket>>,
+    /// Setup and prove requests in progress, per principal. An entry exists only
+    /// while its count is above zero.
+    inflight: Mutex<HashMap<String, usize>>,
+}
+
+/// One request in progress for a principal. Dropping it ends the request.
+#[derive(Debug)]
+pub struct InflightGuard {
+    quota: Arc<QuotaEnforcer>,
+    principal_id: String,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        let mut map = self.quota.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = map.get_mut(&self.principal_id) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.principal_id);
+            }
+        }
+    }
 }
 
 impl Default for QuotaEnforcer {
@@ -64,6 +86,7 @@ impl QuotaEnforcer {
     pub fn new() -> Self {
         Self {
             buckets: RwLock::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -90,6 +113,22 @@ impl QuotaEnforcer {
                 retry_after_secs: wait.ceil() as u64,
             })
         }
+    }
+
+    /// Start one setup or prove request for `principal`, or refuse it when the
+    /// principal already has `max_inflight` in progress.
+    pub fn enter(self: &Arc<Self>, principal: &Principal) -> Result<InflightGuard, ApiError> {
+        let limit = principal.tier.max_inflight;
+        let mut map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        let n = map.entry(principal.id.clone()).or_insert(0);
+        if *n >= limit {
+            return Err(ApiError::InflightLimit { limit });
+        }
+        *n += 1;
+        Ok(InflightGuard {
+            quota: self.clone(),
+            principal_id: principal.id.clone(),
+        })
     }
 
     /// Reject an upload larger than the principal's tier allows.
@@ -168,6 +207,7 @@ mod tests {
             tier: Tier {
                 name: "test".to_string(),
                 max_sessions,
+                max_inflight: 1,
                 max_body_bytes: max_body,
                 requests_per_sec: rate,
                 burst,
@@ -313,4 +353,22 @@ mod tests {
         // The retained bucket still remembers that it is out of credit.
         assert!(q.check_rate_at(&spent, t1).is_err());
     }
+
+    #[test]
+    fn inflight_requests_are_capped_per_principal_and_released_on_drop() {
+        let q = Arc::new(QuotaEnforcer::new());
+        let alice = principal(10.0, 10, 4, 1024);
+        let mut bob = principal(10.0, 10, 4, 1024);
+        bob.id = "bob".to_string();
+
+        let first = q.enter(&alice).unwrap();
+        assert_eq!(q.enter(&alice).unwrap_err().code(), "inflight_limit");
+        // Another principal is not affected.
+        let _bob = q.enter(&bob).unwrap();
+
+        drop(first);
+        assert!(q.enter(&alice).is_ok());
+        assert!(q.inflight.lock().unwrap().get("alice").is_none());
+    }
+
 }

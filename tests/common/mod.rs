@@ -103,12 +103,13 @@ pub fn tier(
             max_body_bytes,
             requests_per_sec,
             burst,
+            max_inflight: 1000,
         },
     );
     t
 }
 
-pub fn setup_request(sapk: &ServerAidedProvingKey) -> SetupRequest {
+pub fn setup_request(sapk: &ServerAidedProvingKey) -> SetupRequest<'static> {
     SetupRequest::encode::<G1Affine, G2Affine>(
         &sapk.emsm_h.generators,
         &sapk.emsm_l.generators,
@@ -119,19 +120,13 @@ pub fn setup_request(sapk: &ServerAidedProvingKey) -> SetupRequest {
     .expect("encoding generators must not fail")
 }
 
-pub fn prove_request(req: &EncryptedRequest) -> ProveRequest {
+pub fn prove_request(req: &EncryptedRequest) -> ProveRequest<'static> {
     ProveRequest::encode(&req.v_h, &req.v_l, &req.v_a, &req.v_b_g1, &req.v_b_g2)
         .expect("encoding masked vectors must not fail")
 }
 
 pub fn decode_response(pr: &ProveResponse) -> ServerResponse {
-    ServerResponse {
-        em_h: ark_from_bytes::<G1Affine>(&pr.em_h).unwrap().into(),
-        em_l: ark_from_bytes::<G1Affine>(&pr.em_l).unwrap().into(),
-        em_a: ark_from_bytes::<G1Affine>(&pr.em_a).unwrap().into(),
-        em_b_g1: ark_from_bytes::<G1Affine>(&pr.em_b_g1).unwrap().into(),
-        em_b_g2: ark_from_bytes::<G2Affine>(&pr.em_b_g2).unwrap().into(),
-    }
+    stealthsnark::protocol::client::decode_prove_response(pr).unwrap()
 }
 
 /// Send a raw request with the correct version header, and optionally a client

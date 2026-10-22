@@ -21,8 +21,10 @@ use axum::http::{header::AUTHORIZATION, HeaderMap};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::body::Bytes;
+use tokio::sync::OwnedSemaphorePermit;
 
 use super::auth::Principal;
+use super::quota::InflightGuard;
 use super::error::ApiError;
 use super::messages::{PROTOCOL_VERSION, SESSION_HEADER, VERSION_HEADER};
 use super::server::AppState;
@@ -41,7 +43,18 @@ pub struct Caller(pub Arc<Principal>);
 /// `Content-Length` check in [`authenticate`] is skipped entirely by a chunked
 /// or HTTP/2 sender that declares no length. This reads the body itself and
 /// stops at `min(tier, transport)`
-pub struct TieredBody(pub Bytes);
+///
+/// Before it reads, it starts one of the caller's in-flight requests (tier
+/// `max_inflight`) and takes an upload slot, so body memory is bounded by
+/// `max_concurrent_uploads` and one caller cannot hold every slot. Keep the
+/// [`Held`] value for as long as the body is alive.
+pub struct TieredBody(pub Bytes, pub Held);
+
+/// The caller's in-flight slot and the upload slot, released on drop.
+pub struct Held {
+    _inflight: InflightGuard,
+    _upload: OwnedSemaphorePermit,
+}
 
 impl FromRequest<AppState> for TieredBody {
     type Rejection = ApiError;
@@ -50,15 +63,24 @@ impl FromRequest<AppState> for TieredBody {
         let (mut parts, body) = req.into_parts();
         let Caller(principal) = Caller::from_request_parts(&mut parts, app).await?;
         let limit = principal.tier.max_body_bytes.min(app.config.max_body_bytes);
-
-        axum::body::to_bytes(body, limit)
+        let inflight = app.quota.enter(&principal).map_err(|e| app.reject(e))?;
+        let upload = app
+            .acquire_slot(&app.upload_slots)
             .await
-            .map(TieredBody)
-            .map_err(|_| {
-                app.reject(ApiError::BodyTooLarge {
-                    limit_bytes: limit as u64,
-                })
+            .map_err(|e| app.reject(e))?;
+
+        let bytes = axum::body::to_bytes(body, limit).await.map_err(|_| {
+            app.reject(ApiError::BodyTooLarge {
+                limit_bytes: limit as u64,
             })
+        })?;
+        Ok(TieredBody(
+            bytes,
+            Held {
+                _inflight: inflight,
+                _upload: upload,
+            },
+        ))
     }
 }
 
@@ -91,7 +113,7 @@ pub async fn authenticate(
     let presented_key = bearer_credential(request.headers());
 
     let principal = app
-        .auth
+        .auth()
         .authenticate(presented_key.as_deref(), cert_digest.as_deref())
         .map_err(|e| app.reject(e))?;
 
@@ -154,7 +176,7 @@ impl FromRequestParts<AppState> for OwnedSession {
 
 /// Reject a caller that does not speak this protocol version.
 ///
-/// bincode is not self-describing, so a message struct that changed shape decodes
+/// postcard is not self-describing, so a message struct that changed shape decodes
 /// as something rather than failing. This turns that into a clean 400.
 pub fn require_version(headers: &HeaderMap) -> Result<(), ApiError> {
     let raw = headers
@@ -232,8 +254,9 @@ mod tests {
         assert!(missing.to_string().contains("<missing>"));
 
         // Version 1 sent the session token in Authorization, so accepting it
-        // would mean reading a session token as an API key.
-        for bad in ["1", "0", "3", "banana", ""] {
+        // would mean reading a session token as an API key. Version 2 used
+        // bincode bodies, which do not decode as postcard.
+        for bad in ["1", "2", "0", "4", "banana", ""] {
             let e = require_version(&headers(&[(VERSION_HEADER, bad)])).unwrap_err();
             assert_eq!(e.code(), "unsupported_version", "accepted version {bad:?}");
         }

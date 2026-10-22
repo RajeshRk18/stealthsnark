@@ -14,7 +14,7 @@
 //!
 //! # Data plane endpoints
 //!
-//! Bodies are bincode over `application/octet-stream`. Every request carries
+//! Bodies are postcard over `application/octet-stream`. Every request carries
 //! `x-stealthsnark-version`. `/v1/prove` and `/v1/session` also carry
 //! `x-stealthsnark-session`.
 //!
@@ -37,7 +37,7 @@
 //! only long enough to clone an `Arc<Session>`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use ark_bn254::{Fr, G1Affine, G1Projective as G1, G2Affine, G2Projective as G2};
@@ -51,7 +51,6 @@ use axum::Router;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
-use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use super::auth::AuthStore;
@@ -67,13 +66,17 @@ use super::session::{Generators, Session, SessionStore};
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<ServerConfig>,
-    pub auth: Arc<AuthStore>,
+    /// Swapped as a whole on SIGHUP. Read it with [`AppState::auth`].
+    pub auth: Arc<RwLock<Arc<AuthStore>>>,
     pub quota: Arc<QuotaEnforcer>,
     pub sessions: Arc<SessionStore>,
     pub metrics: Arc<Metrics>,
     /// Admission control for MSM evaluation. See
     /// [`ServerConfig::max_concurrent_msm`] for why the bound is small.
     pub msm_slots: Arc<Semaphore>,
+    /// Admission control for request bodies. See
+    /// [`ServerConfig::max_concurrent_uploads`].
+    pub upload_slots: Arc<Semaphore>,
     pub shutting_down: Arc<AtomicBool>,
 }
 
@@ -88,31 +91,71 @@ impl AppState {
     pub fn with_auth(config: ServerConfig, auth: AuthStore) -> Self {
         let sessions = Arc::new(SessionStore::new(
             config.max_sessions,
+            config.max_resident_bytes,
             config.session_ttl,
             config.session_max_age,
         ));
         let msm_slots = Arc::new(Semaphore::new(config.max_concurrent_msm));
+        let upload_slots = Arc::new(Semaphore::new(config.max_concurrent_uploads));
         Self {
             config: Arc::new(config),
-            auth: Arc::new(auth),
+            auth: Arc::new(RwLock::new(Arc::new(auth))),
             quota: Arc::new(QuotaEnforcer::new()),
             sessions,
             metrics: Arc::new(Metrics::default()),
             msm_slots,
+            upload_slots,
             shutting_down: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    /// The credential store in force now.
+    pub fn auth(&self) -> Arc<AuthStore> {
+        self.auth.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Load the auth file again and swap it in, and return the principals that
+    /// are no longer in it. Their sessions are removed. A file that does not
+    /// load is an error, and the current store stays in force.
+    pub fn reload_auth(&self) -> anyhow::Result<Vec<String>> {
+        let path = self
+            .config
+            .auth_file
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no STEALTHSNARK_AUTH_FILE to reload"))?;
+        let new = AuthStore::from_file(path, self.config.auth_mode)?;
+        let removed: Vec<String> = self
+            .auth()
+            .principal_ids()
+            .difference(&new.principal_ids())
+            .map(|id| id.to_string())
+            .collect();
+
+        *self.auth.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(new);
+        for id in &removed {
+            self.sessions.remove_all_for(id);
+        }
+        Ok(removed)
+    }
+
     /// Wait a bounded time for an MSM slot.
+    async fn acquire_msm_slot(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        self.acquire_slot(&self.msm_slots).await
+    }
+
+    /// Wait a bounded time for a permit from `slots`.
     ///
     /// Shedding with 503 and `Retry-After` beats queueing without limit: a client
     /// learns at once that it should back off, rather than after a timeout it
     /// cannot tell apart from a crash.
-    async fn acquire_msm_slot(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+    pub(crate) async fn acquire_slot(
+        &self,
+        slots: &Arc<Semaphore>,
+    ) -> Result<OwnedSemaphorePermit, ApiError> {
         if self.shutting_down.load(Ordering::Relaxed) {
             return Err(ApiError::ShuttingDown);
         }
-        let slots = self.msm_slots.clone();
+        let slots = slots.clone();
         match tokio::time::timeout(self.config.admission_wait, slots.acquire_owned()).await {
             Ok(Ok(permit)) => Ok(permit),
             // The semaphore closes only while the process tears down.
@@ -186,22 +229,47 @@ fn with_common_layers<S>(router: Router<S>, cfg: &ServerConfig) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
+    let limit = cfg.request_timeout;
     router
         .layer(CatchPanicLayer::new())
-        // send 503 on a timed-out MSM. 
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::SERVICE_UNAVAILABLE,
-            cfg.request_timeout,
-        ))
+        .layer(axum::middleware::from_fn(move |req, next| {
+            request_timeout(limit, req, next)
+        }))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(TraceLayer::new_for_http())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+        // `SetRequestId` keeps an id the client sent, so a client could put a
+        // chosen or duplicate id in the server logs. Drop it first.
+        .layer(axum::middleware::map_request(
+            |mut req: axum::extract::Request| async move {
+                req.headers_mut().remove("x-request-id");
+                req
+            },
+        ))
+}
+
+/// End a request that runs longer than `limit` with `timeout` (504).
+///
+/// Not retryable: the MSM in `spawn_blocking` keeps running and keeps its slot
+/// after the response is gone, so an immediate retry only queues the same work
+/// a second time.
+async fn request_timeout(
+    limit: std::time::Duration,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    match tokio::time::timeout(limit, next.run(req)).await {
+        Ok(resp) => resp,
+        Err(_) => ApiError::Timeout.into_response(),
+    }
 }
 
 pub async fn serve(state: AppState) -> anyhow::Result<()> {
     let cfg = state.config.clone();
 
     tokio::spawn(sweeper(state.clone()));
+    #[cfg(unix)]
+    tokio::spawn(reload_auth_on_sighup(state.clone()));
 
     let admin = tokio::net::TcpListener::bind(cfg.admin_bind_addr).await?;
     let admin_addr = admin.local_addr()?;
@@ -216,16 +284,26 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
             .as_ref()
             .map(|t| t.client_ca.is_some())
             .unwrap_or(false),
-        principals = state.auth.principal_count(),
-        api_keys = state.auth.api_key_count(),
-        client_certs = state.auth.client_cert_count(),
+        principals = state.auth().principal_count(),
+        api_keys = state.auth().api_key_count(),
+        client_certs = state.auth().client_cert_count(),
         max_body_mib = cfg.max_body_bytes / (1024 * 1024),
         max_sessions = cfg.max_sessions,
+        max_resident_mib = cfg.max_resident_bytes / (1024 * 1024),
         max_concurrent_msm = cfg.max_concurrent_msm,
+        max_concurrent_uploads = cfg.max_concurrent_uploads,
         session_ttl_secs = cfg.session_ttl.as_secs(),
         peak_body_mib = cfg.peak_body_bytes() / (1024 * 1024),
         "StealthSnark server listening"
     );
+
+    if !admin_addr.ip().is_loopback() {
+        tracing::warn!(
+            %admin_addr,
+            "the admin plane is not on loopback; /livez, /readyz and /metrics need no \
+             credential, so restrict this address with a firewall or network policy"
+        );
+    }
 
     if !cfg.auth_mode.is_enabled() {
         // Loud because `validate` only permits this on loopback and an operator
@@ -244,7 +322,7 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
 
     // A tier above the transport ceiling is not an error, but the operator should
     // know that the extra allowance can never be used.
-    let widest_tier = state.auth.max_body_bytes_over_tiers();
+    let widest_tier = state.auth().max_body_bytes_over_tiers();
     if widest_tier > cfg.max_body_bytes {
         tracing::warn!(
             tier_max_body_bytes = widest_tier,
@@ -300,24 +378,38 @@ async fn serve_data_plane(state: AppState) -> anyhow::Result<()> {
     }
 }
 
+/// Connection-level limits for the TLS listener. `serve_tls` sets the timer that
+/// the HTTP/1 header timeout needs: without a timer hyper ignores its default.
+#[cfg(feature = "tls")]
+const H2_MAX_CONCURRENT_STREAMS: u32 = 8;
+#[cfg(feature = "tls")]
+const H2_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// TLS accept loop.
 ///
 /// Hand-rolled because `axum::serve` cannot expose the peer certificate. Each accepted
 /// connection completes its handshake, the peer certificate digest goes into the
 /// request extensions, and hyper will start serving the connection.
+///
+/// On shutdown it stops accepting, tells each open connection to finish its
+/// current requests and close, and returns when all have closed or after
+/// `request_timeout`.
 #[cfg(feature = "tls")]
-async fn serve_tls(
+pub async fn serve_tls(
     listener: tokio::net::TcpListener,
     state: AppState,
     tls_config: rustls::ServerConfig,
 ) -> anyhow::Result<()> {
-    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
     use hyper_util::server::conn::auto::Builder as ConnBuilder;
+    use hyper_util::server::graceful::GracefulShutdown;
     use tower::Service;
 
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
     let router = create_router(state.clone());
     let connections = Arc::new(tokio::sync::Semaphore::new(1024));
+    let graceful = GracefulShutdown::new();
+    let header_read_timeout = state.config.header_read_timeout;
 
     loop {
         // Stop accepting as soon as shutdown begins, but let live connections
@@ -342,6 +434,9 @@ async fn serve_tls(
             tracing::warn!(%peer, "connection limit reached; dropping");
             continue;
         };
+
+        // Subscribed before the handshake, so shutdown also waits for it.
+        let watcher = graceful.watcher();
 
         tokio::spawn(async move {
             let _permit = permit;
@@ -386,16 +481,35 @@ async fn serve_tls(
                 router.clone().call(request)
             });
 
-            if let Err(e) = ConnBuilder::new(TokioExecutor::new())
-                .serve_connection_with_upgrades(io, service)
-                .await
-            {
+            let mut builder = ConnBuilder::new(TokioExecutor::new());
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(header_read_timeout);
+            builder
+                .http2()
+                .timer(TokioTimer::new())
+                .max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS)
+                .keep_alive_interval(H2_KEEP_ALIVE_INTERVAL);
+
+            let conn = builder.serve_connection(io, service);
+            if let Err(e) = watcher.watch(conn).await {
                 tracing::debug!(%peer, error = %e, "connection closed with error");
             }
         });
     }
 
-    tracing::info!("TLS listener stopped accepting new connections");
+    tracing::info!(
+        open_connections = graceful.count(),
+        "TLS listener stopped accepting new connections; draining"
+    );
+    let limit = state.config.request_timeout;
+    if tokio::time::timeout(limit, graceful.shutdown()).await.is_err() {
+        tracing::warn!(
+            limit_secs = limit.as_secs(),
+            "TLS connections still open after the drain limit; closing them"
+        );
+    }
     Ok(())
 }
 
@@ -444,6 +558,32 @@ async fn shutdown_signal(state: AppState) {
     );
 }
 
+/// Reload the auth file on SIGHUP, so a key can be revoked without a restart.
+#[cfg(unix)]
+async fn reload_auth_on_sighup(state: AppState) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut hangup = match signal(SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot listen for SIGHUP; auth reload is off");
+            return;
+        }
+    };
+    while hangup.recv().await.is_some() {
+        match state.reload_auth() {
+            Ok(removed) => tracing::info!(
+                principals = state.auth().principal_count(),
+                ?removed,
+                "auth file reloaded; sessions of removed principals released"
+            ),
+            Err(e) => tracing::error!(
+                error = %e,
+                "auth file reload failed; the current credentials stay in force"
+            ),
+        }
+    }
+}
+
 /// Release generators held by abandoned sessions, and forget idle rate buckets.
 async fn sweeper(state: AppState) {
     let mut ticker = tokio::time::interval(state.config.sweep_interval);
@@ -456,10 +596,8 @@ async fn sweeper(state: AppState) {
 
         let swept = state.sessions.sweep();
         if swept.total() > 0 {
-            state
-                .metrics
-                .sessions_evicted
-                .fetch_add(swept.total() as u64, Ordering::Relaxed);
+            // `/metrics` reads the eviction count from the store, so it is not
+            // counted here a second time.
             // Both reasons are logged, because an operator debugging a session
             // that vanished needs to know which limit ended it.
             tracing::info!(
@@ -530,10 +668,11 @@ async fn handle_setup(
     State(app): State<AppState>,
     _version: ApiVersion,
     Caller(principal): Caller,
-    TieredBody(body): TieredBody,
+    TieredBody(body, slots): TieredBody,
 ) -> Result<Bytes, ApiError> {
     // Charge the session quota before decoding, so an over-quota caller does not
-    // get megabytes of point validation done for free.
+    // get megabytes of point validation done for free. `insert_within` checks
+    // again under the lock, because concurrent setups all pass this check.
     let held = app.sessions.count_for(&principal.id);
     if let Err(e) = app.quota.check_session_allowance(&principal, held) {
         app.metrics.setup_err.fetch_add(1, Ordering::Relaxed);
@@ -548,7 +687,7 @@ async fn handle_setup(
 
     let started = Instant::now();
     let decoded = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+        let _permits = (permit, slots);
         decode_generators(&body)
     })
     .await
@@ -565,7 +704,10 @@ async fn handle_setup(
     let counts = generators.counts();
     let resident = generators.resident_bytes();
 
-    let (token, label) = match app.sessions.insert(&principal.id, generators) {
+    let (token, label) = match app
+        .sessions
+        .insert_within(&principal.id, generators, principal.tier.max_sessions)
+    {
         Ok(pair) => pair,
         Err(e) => {
             app.metrics.setup_err.fetch_add(1, Ordering::Relaxed);
@@ -600,7 +742,7 @@ async fn handle_prove(
     _version: ApiVersion,
     Caller(principal): Caller,
     owned: OwnedSession,
-    TieredBody(body): TieredBody,
+    TieredBody(body, slots): TieredBody,
 ) -> Result<Bytes, ApiError> {
     let permit = app.acquire_msm_slot().await.map_err(|e| {
         app.metrics.prove_err.fetch_add(1, Ordering::Relaxed);
@@ -612,7 +754,7 @@ async fn handle_prove(
     let started = Instant::now();
 
     let computed = tokio::task::spawn_blocking(move || {
-        let _permit = permit; // released when the MSMs finish
+        let _permits = (permit, slots); // released when the MSMs finish
         evaluate_msms(&session, &body)
     })
     .await
@@ -691,12 +833,11 @@ async fn handle_release_all(
 // ---------------------------------------------------------------------------
 
 fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, ApiError> {
-    bincode::serialize(value)
-        .map_err(|e| ApiError::Internal(format!("response encode failed: {e}")))
+    wire_encode(value).map_err(|e| ApiError::Internal(format!("response {e}")))
 }
 
-fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, ApiError> {
-    bincode::deserialize(bytes).map_err(|e| ApiError::MalformedBody(e.to_string()))
+fn decode<'a, T: serde::Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, ApiError> {
+    wire_decode(bytes).map_err(|e| ApiError::MalformedBody(e.to_string()))
 }
 
 // ----------------------------------------------------------------------------
@@ -820,4 +961,44 @@ mod tests {
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(handle_livez().await, StatusCode::OK);
     }
+
+    #[test]
+    fn reload_revokes_removed_principals_and_keeps_the_store_on_a_bad_file() {
+        use super::super::auth::{generate_api_key, AuthMode};
+        use super::super::session::Generators;
+
+        let path = std::env::temp_dir().join(format!("stealthsnark-auth-{}.json", crate::protocol::secret::random_hex(6)));
+        let (alice, bob) = (generate_api_key(), generate_api_key());
+        let record = |id: &str, k: &super::super::auth::GeneratedKey| {
+            serde_json::json!({"id": id, "api_key_id": k.key_id, "api_key_sha256": k.sha256})
+        };
+        let write = |principals: Vec<serde_json::Value>| {
+            std::fs::write(&path, serde_json::json!({ "principals": principals }).to_string()).unwrap()
+        };
+        write(vec![record("alice", &alice), record("bob", &bob)]);
+
+        let config = ServerConfig {
+            auth_mode: AuthMode::ApiKey,
+            auth_file: Some(path.clone()),
+            ..ServerConfig::default()
+        };
+        let app = AppState::with_auth(config, AuthStore::from_file(&path, AuthMode::ApiKey).unwrap());
+        let empty = || Generators::from_points(vec![], vec![], vec![], vec![], vec![]);
+        app.sessions.insert_within("alice", empty(), 4).unwrap();
+        app.sessions.insert_within("bob", empty(), 4).unwrap();
+
+        write(vec![record("bob", &bob)]);
+        assert_eq!(app.reload_auth().unwrap(), vec!["alice".to_string()]);
+        assert_eq!(app.auth().authenticate(Some(&alice.key), None).unwrap_err().code(), "unauthenticated");
+        assert_eq!(app.auth().authenticate(Some(&bob.key), None).unwrap().id, "bob");
+        assert_eq!(app.sessions.count_for("alice"), 0);
+        assert_eq!(app.sessions.count_for("bob"), 1);
+
+        std::fs::write(&path, "not json").unwrap();
+        assert!(app.reload_auth().is_err());
+        assert_eq!(app.auth().authenticate(Some(&bob.key), None).unwrap().id, "bob");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
 }

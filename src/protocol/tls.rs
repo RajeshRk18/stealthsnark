@@ -21,10 +21,10 @@
 //! configured client CA first. The digest only maps an already-verified
 //! certificate to a principal.
 
-use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig as RustlsServerConfig};
@@ -38,6 +38,10 @@ use super::secret::sha256_hex;
 /// certificate. A present value always means rustls accepted the chain.
 #[derive(Clone, Debug)]
 pub struct PeerCertDigest(pub String);
+
+/// Every client is under the operator's control, so TLS 1.2 is only extra
+/// attack surface.
+const TLS13_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
 
 /// Build a rustls server configuration.
 ///
@@ -55,6 +59,12 @@ pub fn server_config(
         anyhow::bail!("no certificates found in {}", paths.cert.display());
     }
     let key = load_private_key(&paths.key)?;
+    if key_file_is_exposed(&paths.key) {
+        tracing::warn!(
+            path = %paths.key.display(),
+            "the TLS private key file is readable by group or other users; run chmod 600 on it"
+        );
+    }
 
     let builder = match &paths.client_ca {
         Some(ca_path) => {
@@ -78,7 +88,7 @@ pub fn server_config(
             }
             .map_err(|e| anyhow::anyhow!("cannot build client certificate verifier: {e}"))?;
 
-            RustlsServerConfig::builder().with_client_cert_verifier(verifier)
+            RustlsServerConfig::builder_with_protocol_versions(TLS13_ONLY).with_client_cert_verifier(verifier)
         }
         None => {
             if require_client_cert {
@@ -86,7 +96,7 @@ pub fn server_config(
                     "auth mode mtls requires a client CA; set STEALTHSNARK_TLS_CLIENT_CA"
                 );
             }
-            RustlsServerConfig::builder().with_no_client_auth()
+            RustlsServerConfig::builder_with_protocol_versions(TLS13_ONLY).with_no_client_auth()
         }
     };
 
@@ -115,33 +125,35 @@ pub fn peer_digest(conn: &rustls::ServerConnection) -> Option<String> {
 fn load_certs(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
     let data = std::fs::read(path)
         .map_err(|e| anyhow::anyhow!("cannot read certificate file {}: {e}", path.display()))?;
-    let mut reader = io::BufReader::new(&data[..]);
-    rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_slice_iter(&data)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("cannot parse certificates in {}: {e}", path.display()))
+}
+
+/// Whether group or other users have any permission on the file.
+#[cfg(unix)]
+fn key_file_is_exposed(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0)
+}
+
+#[cfg(not(unix))]
+fn key_file_is_exposed(_path: &Path) -> bool {
+    false
 }
 
 fn load_private_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
     let data = std::fs::read(path)
         .map_err(|e| anyhow::anyhow!("cannot read key file {}: {e}", path.display()))?;
-    let mut reader = io::BufReader::new(&data[..]);
-
-    // Accept any of the three encodings a key is plausibly delivered in, rather
-    // than making an operator convert the file.
-    while let Some(item) = rustls_pemfile::read_one(&mut reader)
-        .map_err(|e| anyhow::anyhow!("cannot parse key file {}: {e}", path.display()))?
-    {
-        match item {
-            rustls_pemfile::Item::Pkcs8Key(k) => return Ok(PrivateKeyDer::Pkcs8(k)),
-            rustls_pemfile::Item::Pkcs1Key(k) => return Ok(PrivateKeyDer::Pkcs1(k)),
-            rustls_pemfile::Item::Sec1Key(k) => return Ok(PrivateKeyDer::Sec1(k)),
-            _ => continue,
-        }
-    }
-    anyhow::bail!(
-        "no PKCS#8, PKCS#1, or SEC1 private key found in {}",
-        path.display()
-    )
+    // Accepts PKCS#8, PKCS#1 and SEC1, the three encodings a key is plausibly
+    // delivered in, rather than making an operator convert the file.
+    PrivateKeyDer::from_pem_slice(&data).map_err(|e| match e {
+        rustls::pki_types::pem::Error::NoItemsFound => anyhow::anyhow!(
+            "no PKCS#8, PKCS#1, or SEC1 private key found in {}",
+            path.display()
+        ),
+        e => anyhow::anyhow!("cannot parse key file {}: {e}", path.display()),
+    })
 }
 
 #[cfg(test)]
@@ -282,4 +294,20 @@ mod tests {
         let server = load_certs(&pki.dir.join("server.pem")).unwrap();
         assert_ne!(cert_digest(&client[0]), cert_digest(&server[0]));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_key_file_open_to_group_or_others_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("stealthsnark-key-{}", crate::protocol::secret::random_hex(6)));
+        std::fs::write(&path, b"key").unwrap();
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(key_file_is_exposed(&path));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!key_file_is_exposed(&path));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
 }

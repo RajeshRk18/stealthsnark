@@ -27,7 +27,7 @@ fn generators_body(n: usize, seed: u64) -> Vec<u8> {
     let g1: Vec<G1Affine> = (0..n).map(|_| G1::rand(&mut rng).into_affine()).collect();
     let g2: Vec<G2Affine> = Vec::new();
     let req = SetupRequest::encode(&g1, &g1, &g1, &g1, &g2).unwrap();
-    bincode::serialize(&req).unwrap()
+    stealthsnark::protocol::messages::wire_encode(&req).unwrap()
 }
 
 fn http() -> reqwest::Client {
@@ -139,7 +139,7 @@ async fn a_session_token_is_useless_to_another_principal() {
     let (alice, bob) = (&keys[0].key, &keys[1].key);
 
     let resp = setup_as(&url, Some(alice), generators_body(8, 3)).await;
-    let issued: SetupResponse = bincode::deserialize(&resp.bytes().await.unwrap()).unwrap();
+    let issued: SetupResponse = stealthsnark::protocol::messages::wire_decode(&resp.bytes().await.unwrap()).unwrap();
 
     // Bob authenticates correctly but presents Alice's session token.
     let resp = raw(
@@ -267,7 +267,7 @@ async fn session_quota_is_enforced_per_principal() {
     for i in 0..2 {
         let resp = setup_as(&url, Some(alice), generators_body(4, 30 + i)).await;
         assert!(resp.status().is_success());
-        let issued: SetupResponse = bincode::deserialize(&resp.bytes().await.unwrap()).unwrap();
+        let issued: SetupResponse = stealthsnark::protocol::messages::wire_decode(&resp.bytes().await.unwrap()).unwrap();
         tokens.push(issued.session_token);
     }
 
@@ -315,7 +315,7 @@ async fn session_quota_is_enforced_per_principal() {
     .unwrap();
     assert!(resp.status().is_success());
 
-    let released: ReleaseAllResponse = bincode::deserialize(&resp.bytes().await.unwrap()).unwrap();
+    let released: ReleaseAllResponse = stealthsnark::protocol::messages::wire_decode(&resp.bytes().await.unwrap()).unwrap();
     assert_eq!(released.released, 2);
     assert_eq!(state.sessions.count_for("alice"), 0);
 
@@ -546,4 +546,42 @@ async fn a_client_without_a_key_is_refused_clearly() {
     let text = err.to_string();
     assert!(text.contains("401"), "got: {text}");
     assert!(text.contains("unauthenticated"), "got: {text}");
+}
+
+/// One principal cannot hold every slot: with `max_inflight = 1`, its second
+/// request while the first is in progress is refused, and another principal is
+/// still served.
+#[tokio::test]
+async fn one_principal_cannot_hold_more_than_its_inflight_slots() {
+    use tokio::io::AsyncWriteExt;
+
+    let mut tiers = tier("solo", 8, 64 * 1024 * 1024, 1000.0, 1000);
+    tiers.get_mut("solo").unwrap().max_inflight = 1;
+    let (auth, keys) = auth_store_with_keys(&["alice", "bob"], Some("solo"), tiers, AuthMode::ApiKey);
+    let (url, _state) = spawn_with_auth(ServerConfig::default(), auth).await;
+    let addr = url.trim_start_matches("http://");
+
+    // Alice starts an upload and does not finish it.
+    let mut slow = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let head = format!(
+        "POST /v1/setup HTTP/1.1\r\nHost: {addr}\r\n{VERSION_HEADER}: {PROTOCOL_VERSION}\r\n\
+         Authorization: Bearer {}\r\nContent-Type: application/octet-stream\r\n\
+         Content-Length: 1000\r\n\r\n",
+        keys[0].key
+    );
+    slow.write_all(head.as_bytes()).await.unwrap();
+    slow.write_all(&[0u8; 10]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let resp = setup_as(&url, Some(&keys[0].key), generators_body(4, 41)).await;
+    assert_eq!(resp.status().as_u16(), 429);
+    assert_eq!(error_code(resp).await, "inflight_limit");
+
+    let resp = setup_as(&url, Some(&keys[1].key), generators_body(4, 42)).await;
+    assert_eq!(resp.status().as_u16(), 200, "bob must not be blocked by alice");
+
+    drop(slow);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let resp = setup_as(&url, Some(&keys[0].key), generators_body(4, 43)).await;
+    assert_eq!(resp.status().as_u16(), 200, "alice's slot is free once her upload ends");
 }

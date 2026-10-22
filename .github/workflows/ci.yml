@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Weekly, so a new advisory against an unchanged Cargo.lock still fails CI.
+  schedule:
+    - cron: "0 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  ci-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # ponytail: pinned to 1.88. ark-circom 0.5 pulls wasmer-vm 4.4, which links
+      # `__rust_probestack` on x86_64; Rust 1.89 removed that symbol, so the link
+      # fails. Unpin after moving to ark-circom 0.6 (arkworks 0.6, wasmer 6).
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+      - name: Install circom
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -sSfL -o "$HOME/bin/circom" https://github.com/iden3/circom/releases/download/v2.2.3/circom-linux-amd64
+          chmod +x "$HOME/bin/circom"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: scripts/harness-check.sh ci-linux

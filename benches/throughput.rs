@@ -54,9 +54,9 @@ fn fixture(n: usize, seed: u64) -> Fixture {
     );
 
     let setup_body =
-        bincode::serialize(&SetupRequest::encode(&gh, &gl, &ga, &gb1, &gb2).unwrap()).unwrap();
+        stealthsnark::protocol::messages::wire_encode(&SetupRequest::encode(&gh, &gl, &ga, &gb1, &gb2).unwrap()).unwrap();
     let prove_body = Bytes::from(
-        bincode::serialize(&ProveRequest::encode(&vh, &vl, &va, &vb1, &vb2).unwrap()).unwrap(),
+        stealthsnark::protocol::messages::wire_encode(&ProveRequest::encode(&vh, &vl, &va, &vb1, &vb2).unwrap()).unwrap(),
     );
 
     Fixture { n, setup_body, prove_body, expected }
@@ -103,7 +103,7 @@ async fn measure(label: &str, fx: &Fixture, cfg: ServerConfig, workers: usize, p
         .await
         .unwrap();
     assert!(resp.status().is_success(), "setup failed: {}", resp.status());
-    let setup: SetupResponse = bincode::deserialize(&resp.bytes().await.unwrap()).unwrap();
+    let setup: SetupResponse = stealthsnark::protocol::messages::wire_decode(&resp.bytes().await.unwrap()).unwrap();
     let token = Arc::new(setup.session_token);
 
     let probe = client
@@ -115,7 +115,7 @@ async fn measure(label: &str, fx: &Fixture, cfg: ServerConfig, workers: usize, p
         .await
         .unwrap();
     assert!(probe.status().is_success(), "prove failed: {}", probe.status());
-    let pr: ProveResponse = bincode::deserialize(&probe.bytes().await.unwrap()).unwrap();
+    let pr: ProveResponse = stealthsnark::protocol::messages::wire_decode(&probe.bytes().await.unwrap()).unwrap();
     let got = (
         G1::from(ark_from_bytes::<G1Affine>(&pr.em_h).unwrap()),
         G1::from(ark_from_bytes::<G1Affine>(&pr.em_l).unwrap()),

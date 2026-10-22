@@ -135,24 +135,22 @@ pub fn client_encrypt<QAP: R1CSToQAP, C: ConstraintSynthesizer<Fr>, R: Rng>(
     let r = Fr::rand(rng);
     let s = Fr::rand(rng);
 
+    check_witness_len(sapk, witness.len())?;
+
     // Mask h polynomial
-    let h_scalars = pad_or_trim(&h_poly, sapk.emsm_h.generators.len());
+    let h_scalars = fit_h(&h_poly, sapk.emsm_h.generators.len());
     let (v_h, lpn_h) = encrypt(&sapk.emsm_h, &h_scalars, rng);
 
     // Mask witness scalars for l_query
-    let l_scalars = pad_or_trim(&witness, sapk.emsm_l.generators.len());
-    let (v_l, lpn_l) = encrypt(&sapk.emsm_l, &l_scalars, rng);
+    let (v_l, lpn_l) = encrypt(&sapk.emsm_l, &witness, rng);
 
     // Mask witness scalars for a_query (witness portion only)
-    let a_scalars = pad_or_trim(&witness, sapk.emsm_a.generators.len());
-    let (v_a, lpn_a) = encrypt(&sapk.emsm_a, &a_scalars, rng);
+    let (v_a, lpn_a) = encrypt(&sapk.emsm_a, &witness, rng);
 
     // Mask witness scalars for b_g1 and b_g2 (independent LPN instances)
-    let b_g1_scalars = pad_or_trim(&witness, sapk.emsm_b_g1.generators.len());
-    let (v_b_g1, lpn_b_g1) = encrypt(&sapk.emsm_b_g1, &b_g1_scalars, rng);
+    let (v_b_g1, lpn_b_g1) = encrypt(&sapk.emsm_b_g1, &witness, rng);
 
-    let b_g2_scalars = pad_or_trim(&witness, sapk.emsm_b_g2.generators.len());
-    let (v_b_g2, lpn_b_g2) = encrypt(&sapk.emsm_b_g2, &b_g2_scalars, rng);
+    let (v_b_g2, lpn_b_g2) = encrypt(&sapk.emsm_b_g2, &witness, rng);
 
     let request = EncryptedRequest {
         v_h,
@@ -264,7 +262,7 @@ pub fn client_decrypt(
 }
 
 // --------------------------- Malicious-secure variants -----------------------------------
-// These use double-query EMSM (main + check) per MSM so that a cheating server can be detected 
+// These use double-query EMSM (main + check) per MSM so that a cheating server can be detected
 /// 10 masked vectors (5 main + 5 check) are sent in malicious mode.
 pub struct MaliciousEncryptedRequest {
     pub h: MaliciousEncrypted<Fr>,
@@ -329,20 +327,17 @@ pub fn malicious_client_encrypt<QAP: R1CSToQAP, C: ConstraintSynthesizer<Fr>, R:
     let r = Fr::rand(rng);
     let s = Fr::rand(rng);
 
-    let h_scalars = pad_or_trim(&h_poly, sapk.emsm_h.generators.len());
+    check_witness_len(sapk, witness.len())?;
+    let h_scalars = fit_h(&h_poly, sapk.emsm_h.generators.len());
     let (enc_h, ds_h) = malicious_encrypt(&sapk.emsm_h, &h_scalars, rng);
 
-    let l_scalars = pad_or_trim(&witness, sapk.emsm_l.generators.len());
-    let (enc_l, ds_l) = malicious_encrypt(&sapk.emsm_l, &l_scalars, rng);
+    let (enc_l, ds_l) = malicious_encrypt(&sapk.emsm_l, &witness, rng);
 
-    let a_scalars = pad_or_trim(&witness, sapk.emsm_a.generators.len());
-    let (enc_a, ds_a) = malicious_encrypt(&sapk.emsm_a, &a_scalars, rng);
+    let (enc_a, ds_a) = malicious_encrypt(&sapk.emsm_a, &witness, rng);
 
-    let b_g1_scalars = pad_or_trim(&witness, sapk.emsm_b_g1.generators.len());
-    let (enc_b_g1, ds_b_g1) = malicious_encrypt(&sapk.emsm_b_g1, &b_g1_scalars, rng);
+    let (enc_b_g1, ds_b_g1) = malicious_encrypt(&sapk.emsm_b_g1, &witness, rng);
 
-    let b_g2_scalars = pad_or_trim(&witness, sapk.emsm_b_g2.generators.len());
-    let (enc_b_g2, ds_b_g2) = malicious_encrypt(&sapk.emsm_b_g2, &b_g2_scalars, rng);
+    let (enc_b_g2, ds_b_g2) = malicious_encrypt(&sapk.emsm_b_g2, &witness, rng);
 
     let request = MaliciousEncryptedRequest {
         h: enc_h,
@@ -480,23 +475,37 @@ pub fn malicious_client_decrypt(
     })
 }
 
-/// Adjust a vector to exactly `target_len` by zero-padding or trimming.
-/// Logs a warning if the lengths don't match, since this may indicate a setup misconfiguration.
-fn pad_or_trim(v: &[Fr], target_len: usize) -> Vec<Fr> {
-    if v.len() != target_len {
-        tracing::warn!(
-            "pad_or_trim: vector length {} != target {}, adjusting",
-            v.len(),
-            target_len
-        );
+/// Fit the QAP quotient to the `h_query` length.
+///
+/// The reduction can return more coefficients than `h_query` has bases (one more
+/// for `LibsnarkReduction`). arkworks' own prover also uses only `h_query.len()`.
+fn fit_h(h: &[Fr], len: usize) -> Vec<Fr> {
+    let mut v = h[..h.len().min(len)].to_vec();
+    v.resize(len, Fr::zero());
+    v
+}
+
+/// The witness must match every witness-indexed query of the proving key. A
+/// mismatch means the key belongs to a different circuit, and changing the
+/// length would only produce a proof that does not verify.
+fn check_witness_len(
+    sapk: &ServerAidedProvingKey,
+    witness_len: usize,
+) -> Result<(), anyhow::Error> {
+    for (query, expected) in [
+        ("l_query", sapk.emsm_l.generators.len()),
+        ("a_query", sapk.emsm_a.generators.len()),
+        ("b_g1_query", sapk.emsm_b_g1.generators.len()),
+        ("b_g2_query", sapk.emsm_b_g2.generators.len()),
+    ] {
+        if witness_len != expected {
+            anyhow::bail!(
+                "witness has {witness_len} elements but the proving key's {query} expects {expected}; \
+                 the key is for a different circuit"
+            );
+        }
     }
-    if v.len() >= target_len {
-        v[..target_len].to_vec()
-    } else {
-        let mut padded = v.to_vec();
-        padded.resize(target_len, Fr::zero());
-        padded
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -592,5 +601,41 @@ mod tests {
 
         let result = malicious_client_decrypt(&sapk, &response, &state);
         assert!(result.is_err(), "Should detect tampered MSM result");
+    }
+
+    /// One witness variable, where `CubeCircuit` has three.
+    struct OneWitness;
+
+    impl ConstraintSynthesizer<Fr> for OneWitness {
+        fn generate_constraints(
+            self,
+            cs: ark_relations::r1cs::ConstraintSystemRef<Fr>,
+        ) -> Result<(), ark_relations::r1cs::SynthesisError> {
+            let x = cs.new_witness_variable(|| Ok(Fr::from(3u64)))?;
+            let y = cs.new_input_variable(|| Ok(Fr::from(9u64)))?;
+            cs.enforce_constraint(
+                ark_relations::lc!() + x,
+                ark_relations::lc!() + x,
+                ark_relations::lc!() + y,
+            )
+        }
+    }
+
+    #[test]
+    fn a_key_for_another_circuit_is_an_error_not_an_invalid_proof() {
+        let mut rng = ChaCha20Rng::seed_from_u64(7);
+        let (pk, _vk) =
+            Groth16::<Bn254>::circuit_specific_setup(CubeCircuit::<Fr> { x: None }, &mut rng)
+                .unwrap();
+        let sapk = ServerAidedProvingKey::setup(pk, &mut rng);
+
+        let err = client_encrypt::<LibsnarkReduction, _, _>(&sapk, OneWitness, &mut rng)
+            .err()
+            .expect("witness length mismatch must be refused");
+        assert!(err.to_string().contains("different circuit"), "got: {err}");
+        assert!(
+            malicious_client_encrypt::<LibsnarkReduction, _, _>(&sapk, OneWitness, &mut rng)
+                .is_err()
+        );
     }
 }

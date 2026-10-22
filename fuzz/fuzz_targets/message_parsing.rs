@@ -11,7 +11,7 @@ use stealthsnark::protocol::messages::{ark_vec_from_bytes, ProveRequest, SetupRe
 
 fuzz_target!(|data: &[u8]| {
     // /v1/setup pipeline: body -> SetupRequest -> generator vectors.
-    if let Ok(req) = bincode::deserialize::<SetupRequest>(data) {
+    if let Ok(req) = stealthsnark::protocol::messages::wire_decode::<SetupRequest>(data) {
         let _ = ark_vec_from_bytes::<G1Affine>(&req.h_generators);
         let _ = ark_vec_from_bytes::<G1Affine>(&req.l_generators);
         let _ = ark_vec_from_bytes::<G1Affine>(&req.a_generators);
@@ -20,7 +20,7 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // /v1/prove pipeline: body -> ProveRequest -> masked scalar vectors.
-    if let Ok(req) = bincode::deserialize::<ProveRequest>(data) {
+    if let Ok(req) = stealthsnark::protocol::messages::wire_decode::<ProveRequest>(data) {
         let _ = ark_vec_from_bytes::<Fr>(&req.v_h);
         let _ = ark_vec_from_bytes::<Fr>(&req.v_l);
         let _ = ark_vec_from_bytes::<Fr>(&req.v_a);

@@ -59,7 +59,7 @@ CLIENT                                             SERVER
                         │         ▼            ▼              │              │              │
                         │  ┌──────────────────────────┐       │              │              │
                         │  │  BLOCKING POOL           │       │              │              │
-                        │  │  bincode decode          │       │              │              │
+                        │  │  postcard decode         │       │              │              │
                         │  │  point decode (subgroup) │       │              │              │
                         │  │  Pedersen::commit x5     │       │              │              │
                         │  │  (rayon inside each)     │       │              │              │
@@ -81,7 +81,7 @@ CLIENT                                             SERVER
    ┌────────────┐       │  ┌──────────────────────────────────────────────────────────────┐  │
    │ prometheus │──HTTP►│  │ /livez    always 200 if the process is up                    │  │
    │ or probe   │       │  │ /readyz   503 when draining or when 0 MSM slots are free     │  │
-   └────────────┘       │  │ /metrics  14 counters, 4 gauges, Prometheus text             │  │
+   └────────────┘       │  │ /metrics  13 counters, 4 gauges, Prometheus text             │  │
                         │  └──────────────────────────────────────────────────────────────┘  │
                         └────────────────────────────────────────────────────────────────────┘
 ```
@@ -117,6 +117,16 @@ Terminal 2, run the client:
 ```sh
 cargo run --bin client
 ```
+
+## Checks
+
+```sh
+scripts/harness-check.sh quick      # library unit tests, seconds
+scripts/harness-check.sh ci-linux   # what CI runs: build, all tests, fuzz crate, cargo deny
+```
+
+`ci-linux` needs `circom` 2.2.3 and `cargo-deny`. CI runs it on every push to `main`,
+on pull requests, and weekly for new advisories.
 
 ## Using your own circuit
 
@@ -180,9 +190,8 @@ Throughput is flat across the bounds while per request increases. This may be be
 
 ## Limitations and future TODOs
 
-- Move from bincode. Use postcard or something.
 - Certificate identity is pinned by digest. mTLS identifies a client by the SHA-256 of its certificate, so a renewed certificate is a new identity and must be re-registered.
-- API keys live forever. Removing a record from the auth file revokes a key but it needs a restart. There is no online revocation and no expiry.
+- API keys have no expiry. To revoke a key, remove its record from the auth file and send `SIGHUP`; the server reloads the file without a restart.
 - Currently, user's quota is per process. Rate-limit and session counts live in memory, so it is fine for a single-server instance we have now. This can be a todo to demonstrate shared state in a distributed architecture if we implement multiple servers or clusters support.
 - Session token lookup is not constant-time.
 - Resource exhaustion is within the configured limits. Currently, server admits only `STEALTHSNARK_MAX_CONCURRENT_MSM` MSMs of up to `STEALTHSNARK_MAX_BODY_BYTES` each as we dont want the server to Dos attacked.

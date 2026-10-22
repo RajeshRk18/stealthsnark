@@ -22,7 +22,10 @@ that was locked down. It is an adversary the protocol tolerates:
 - Scalars arrive masked with LPN-derived noise, so their values are statistically
   independent of the witness.
 - In malicious mode the client sends two queries per MSM and cross-checks them, so
-  a wrong result is caught with probability about `1 - 2^-254`.
+  a wrong result is caught with probability about `1 - 2^-254`. On the wire these
+  are two `/v1/prove` calls on one session, in random order
+  (`EmsmClient::send_prove_malicious`), so the server cannot tell which one is the
+  check.
 
 So confidentiality of the payload is not the backend's job. The cryptography
 already has it. The backend's job is availability, isolation between clients, and
@@ -43,7 +46,7 @@ src/protocol/
   server.rs     AppState, both routers, TLS accept loop, handlers, shutdown
   error.rs      ApiError, status mapping, stable machine codes
   metrics.rs    atomic counters, Prometheus text rendering
-  messages.rs   wire types, bincode helpers, protocol version and headers
+  messages.rs   wire types, postcard helpers, protocol version and headers
   secret.rs     random_hex, hex, sha256_hex, constant_time_eq
   tls.rs        rustls config, client CA, certificate digests  (feature = "tls")
 src/bin/
@@ -91,12 +94,12 @@ leave the host.
 
 On one port that needs a rule like "require a credential on every path except
 these three". That is a conditional which can be wrong without anyone noticing.
-Two ports encode the same policy structurally. `ServerConfig::validate` enforces
-both halves: startup fails if the admin address is not loopback, and fails if the
-two addresses are equal.
-
-The cost is real. `/metrics` cannot be scraped from another host without a
-sidecar or a tunnel.
+Two ports encode the same policy structurally. `ServerConfig::validate` refuses
+two addresses that are the same socket. The admin address is loopback by default.
+An operator can set a non-loopback admin address, because a load balancer, a
+Kubernetes `httpGet` probe, or a Prometheus server on another host cannot reach
+loopback. Startup then logs a warning: the admin paths need no credential, so the
+network must restrict that address.
 
 `AppState` holds seven fields, each behind an `Arc`, so the `Clone` that axum
 performs per request is seven pointer bumps. Both routers share one instance,
@@ -116,7 +119,7 @@ failing earlier is cheaper.
    nothing behind it.
 5. `serve(AppState::with_auth(config, auth))`.
 
-`validate()` refuses nine combinations. The first is the one that matters most,
+`validate()` refuses eight combinations. The first is the one that matters most,
 because no missing environment variable may produce an open compute service.
 
 | Refused | Reason |
@@ -127,13 +130,14 @@ because no missing environment variable may produce an open compute service.
 | `mtls` without a client CA | nothing to verify certificates against |
 | TLS cert without key, or key without cert | half a configuration |
 | TLS configured, binary built without the `tls` feature | would serve plain HTTP on a port believed encrypted |
-| admin bind not loopback | `/metrics` would leave the host |
-| admin bind equals data bind | the open plane would share the closed port |
+| admin bind is the data bind socket (same port, same or wildcard address) | the open plane would share the closed port |
 | `session_max_age < session_ttl` | the idle timeout would be unreachable |
 
-Startup logs `peak_body_mib`, which is `max_body_bytes * max_concurrent_msm`. That
+Startup logs `peak_body_mib`, which is
+`max_body_bytes * max_concurrent_uploads + 9/4 * max_body_bytes * max_concurrent_msm`:
+every upload slot full, plus the decoded points of every setup in progress. That
 product, not either factor alone, is the worst-case resident memory from in-flight
-bodies. An operator raising the body limit for a bigger circuit needs to see the
+requests. An operator raising the body limit for a bigger circuit needs to see the
 multiplication happen.
 
 ## 5. The request path
@@ -146,10 +150,11 @@ the layers bottom-up. This is the opposite of `ServiceBuilder` reading order.
 ```
 request
   │
+  ├─ strip x-request-id    drop an id the client sent
   ├─ SetRequestId          assign x-request-id (uuid)
   ├─ Trace                 open a span; later log lines carry the id
   ├─ PropagateRequestId    on the way out, copy the id onto the response
-  ├─ Timeout               request_timeout, 503 on expiry
+  ├─ request_timeout       504 `timeout` on expiry
   ├─ CatchPanic            innermost shared layer
   │
   ├─ DefaultBodyLimit      max_body_bytes            ┐ data plane only
@@ -171,9 +176,11 @@ realistically originate. One bad request becomes one 500 instead of a dead
 process. A panic in `Trace` would not be caught, which is acceptable: those layers
 do not touch untrusted data.
 
-The timeout returns 503, not the default 408. A timed-out MSM is the server
-failing to finish, which is a server condition and retryable. 408 would blame the
-client.
+The timeout returns 504 with code `timeout`, not retryable. It is a server
+condition, so not 408, which would blame the client. It is not 503 either: the
+response is gone, but the MSM in `spawn_blocking` keeps running and keeps its
+slot, so a client that retries at once only queues the same work a second time.
+Set `STEALTHSNARK_REQUEST_TIMEOUT_SECS` above the slowest MSM you serve.
 
 ### 5.2 Authentication runs before routing
 
@@ -227,7 +234,7 @@ step 2 and never touches any principal's bucket.
  ────────────────────                    ─────────────
  accept, parse headers
  auth, quota, session lookup
- acquire MSM permit  ──────spawn_blocking──► bincode decode
+ acquire MSM permit  ──────spawn_blocking──► postcard decode
                                             point decode (subgroup checks)
                                             Pedersen::commit x5  (rayon inside)
                                             serialise results
@@ -265,6 +272,14 @@ tokio::task::spawn_blocking(move || {
 
 `/v1/setup` also takes a permit although it computes no MSM, because decoding
 192 MiB of generators is minutes of the same CPU work.
+
+Bodies have their own semaphore, `upload_slots`, with `max_concurrent_uploads`
+permits (default `2 * max_concurrent_msm`). `TieredBody` takes a permit before it
+reads the first byte, and the handler moves it into the blocking closure with the
+MSM permit. Without it, axum reads the body in the extractor, before the handler
+can wait for an MSM slot, so every connection could hold a full body in memory
+while it waits. A separate semaphore, not the MSM one, because a slow upload would
+otherwise hold a compute slot while it sends.
 
 ### 6.3 Lock discipline
 
@@ -363,6 +378,10 @@ if map.len() >= self.max_sessions { return Err(ApiError::SessionLimit); }
 Without that, a map full of abandoned sessions would reject a legitimate new one
 even though every entry in it was already dead.
 
+The per-principal allowance is checked under the same write lock. `/v1/setup`
+also checks it before the decode, as a fast refusal, but that check alone lets
+concurrent setups from one principal all pass.
+
 `SessionLimit` (process-wide) and `SessionQuotaExceeded` (per-principal) are
 distinct errors sharing status 429. The first says the host is full, the second
 says one client is.
@@ -399,7 +418,7 @@ says the credential may be stale, 403 says no retry with this identity can work.
 This forced the protocol version to 2. Version 1 put the session token in
 `Authorization`, so a v1 client against a v2 server would present a session token
 where an API key is expected. The version header turns that into a clear
-rejection.
+rejection. Version 3 changed the body encoding from bincode to postcard.
 
 ### 8.1 API keys
 
@@ -441,7 +460,19 @@ Digest identity also avoids parsing X.509 subject names, which would be attack
 surface for no benefit. The cost is that a renewed certificate is a new identity
 and must be re-registered.
 
-### 8.3 The anonymous principal
+### 8.3 Revocation
+
+`SIGHUP` reloads the auth file. `AppState::reload_auth` parses the new file, swaps
+the whole store behind an `RwLock<Arc<AuthStore>>`, and releases the sessions of
+each principal that is no longer in the file. Each request authenticates again, so
+a removed key or certificate fails on its next request, also on an open mTLS
+connection. A file that does not parse is logged at `error` and the current store
+stays in force: a typo must not lock out every client.
+
+Before this, revocation needed a restart, which also dropped every session and,
+with TLS, the proofs in progress. That gave an operator a reason to wait.
+
+### 8.4 The anonymous principal
 
 With `STEALTHSNARK_AUTH=disabled` every caller is `anonymous` on
 `Tier::unlimited()`. The reasoning is worth recording because the first version
@@ -498,9 +529,19 @@ over-quota upload is refused rather than buffered and then discarded. For a
 Counted live by walking the map, excluding entries that are expired but not yet
 swept, so a principal is not charged for allowance it no longer holds.
 
+### 9.4 Requests in progress
+
+The MSM and upload slots are shared by all principals, and the rate limit counts
+requests, not the time they take. A prove takes seconds, so one principal at 2
+requests per second could keep every slot full. `TieredBody` therefore calls
+`QuotaEnforcer::enter` before it takes an upload slot. The tier's `max_inflight`
+(default 2) caps the setup and prove requests one principal has in progress. The
+guard lives with the body and decrements on drop, so the slot is free when the
+MSMs finish. A refusal is `inflight_limit`, 429, `Retry-After: 1`.
+
 ## 10. Error model
 
-`ApiError` has 14 variants, each with a stable machine code. Wire shape is
+`ApiError` has 16 variants, each with a stable machine code. Wire shape is
 `{"code": "...", "message": "..."}`.
 
 | Code | Status | Retryable |
@@ -515,9 +556,11 @@ swept, so a principal is not charged for allowance it no longer holds.
 | `body_too_large` | 413 | no |
 | `rate_limited` | 429 | yes |
 | `session_quota_exceeded` | 429 | yes |
+| `inflight_limit` | 429 | yes |
 | `session_limit` | 429 | yes |
 | `overloaded` | 503 | yes |
 | `shutting_down` | 503 | yes |
+| `timeout` | 504 | no |
 | `internal` | 500 | no |
 
 Four rules behind the table:
@@ -532,7 +575,7 @@ Four rules behind the table:
   delay; the others use 5 seconds.
 - Distinguishability is the goal. The first version returned a bare 400 with no
   body for every failure, so a client could not tell a length mismatch from a bad
-  point encoding from corrupt bincode: three problems, three different fixes, one
+  point encoding from corrupt framing: three problems, three different fixes, one
   indistinguishable response.
 
 The client mirrors this. `classify(code)` maps every code to `client_error`,
@@ -542,23 +585,28 @@ build until the client handles it.
 
 ## 11. Wire format
 
-bincode with default configuration, `application/octet-stream`.
+postcard, `application/octet-stream`, protocol version 3. Version 2 used bincode,
+which is unmaintained (RUSTSEC-2025-0141).
 
 | Level | Layout |
 |---|---|
-| A `Vec<u8>` field | `u64` length little-endian, then the bytes |
-| Inside a field | `u64` element count, then each element compressed |
+| A byte field | varint (LEB128) length, then the bytes |
+| Inside a field | arkworks `u64` element count little-endian, then each element compressed |
 
-A minimal valid `SetupRequest` with five empty generator sets is 80 bytes: five
-fields, each an 8 byte bincode length of 8 followed by an 8 byte arkworks count of
+A minimal valid `SetupRequest` with five empty generator sets is 45 bytes: five
+fields, each a 1 byte varint length of 8 followed by an 8 byte arkworks count of
 zero.
 
 ```python
 field = struct.pack('<Q', 0)                                          # 0 elements
-body  = b''.join(struct.pack('<Q', len(field)) + field for _ in range(5))
+body  = b''.join(bytes([len(field)]) + field for _ in range(5))       # varint 8 is one byte
 ```
 
-**bincode is not self-describing.** A struct that gains a field decodes as
+`wire_decode` refuses bytes after the message, so a body cannot carry a hidden
+suffix. Request fields are `Cow<[u8]>` and borrow from the body when decoded, so
+the server does not copy the generators before it parses them.
+
+**postcard is not self-describing.** A struct that gains a field decodes as
 something rather than failing, which is silent corruption. That is the entire
 reason the version header is mandatory.
 
@@ -595,19 +643,17 @@ means a client cannot connect at all, and the rustls error text is the only thin
 that says why. At `debug` the operator sees an unreachable service and a silent
 server.
 
-`/metrics` renders 14 counters and 4 gauges from atomics, hand-rolled rather than
+`/metrics` renders 13 counters and 4 gauges from atomics, hand-rolled rather than
 via a metrics framework, because the render is a `writeln!` loop.
 
-Two metrics deserve alerts:
+`rejected_unauthenticated_total` deserves an alert: a sustained rise is credential
+guessing.
 
-| Metric | Meaning |
-|---|---|
-| `consistency_check_failures_total` | a server returned inconsistent MSM results, so it cheated or corrupted data |
-| `rejected_unauthenticated_total` | a sustained rise is credential guessing |
-
-The first is the most important signal the system can emit. Before this work it
-existed only as a `Result` on the client side that nothing aggregated. It is
-exported as zero so an alert can be written before it ever fires.
+A failed malicious-mode consistency check is the most important signal the system
+can emit, but only the client can see it: the check runs on the client, after both
+responses arrive. A server metric for it would always be zero. The client reports
+it as `MaliciousError::ConsistencyCheckFailed`, and the demo client logs it at
+`error`.
 
 ## 13. Health, readiness, shutdown
 
@@ -650,10 +696,13 @@ Owning the loop means owning what `axum::serve` did for free:
 
 | Responsibility | Implementation |
 |---|---|
-| graceful shutdown | `AtomicBool` polled in a `select!` against `accept()` |
+| graceful shutdown | `AtomicBool` polled in a `select!` against `accept()`; then `GracefulShutdown` tells each connection to finish its requests and close, and `serve_tls` waits up to `request_timeout` for them |
 | connection cap | 1024-permit semaphore; unbounded half-open handshakes are a memory exhaustion path |
 | handshake timeout | 15 s; without it a client that opens a socket and sends nothing holds a slot for ever |
+| header read timeout | `header_read_timeout`, 10 s; hyper applies it only when a timer is set, so the builder sets `TokioTimer`. Without it a client that sends header bytes slowly holds a slot for ever, before authentication runs |
+| HTTP/2 streams | 8 concurrent streams per connection (hyper default 200), keep-alive ping every 30 s |
 | ALPN | `alpn_protocols = ["h2", "http/1.1"]`, or you get HTTP/1.1 only |
+| protocol version | TLS 1.3 only; every client is under the operator's control |
 
 TLS sits behind a default-on `tls` feature so the lean core stays buildable under
 the cargo-fuzz sanitizer. With the feature off, configured TLS is a startup error,
@@ -663,16 +712,16 @@ never a downgrade.
 
 | Source | Worst case |
 |---|---|
-| in-flight request bodies | `max_body_bytes * max_concurrent_msm`, 256 MiB * 4 = 1 GiB |
-| resident session generators | `max_sessions * per-session size` |
-| decoded working set during an MSM | roughly the generator set again, per concurrent MSM |
+| in-flight request bodies | `max_body_bytes * max_concurrent_uploads`, 256 MiB * 8 = 2 GiB |
+| resident session generators | `min(max_sessions * per-session size, max_resident_bytes)` |
+| decoded points during a setup | about `9/4 * max_body_bytes` per concurrent MSM |
 | rate buckets | about 50 bytes per distinct principal, swept |
 
-The session cap is the loose one. 64 sessions of a 2^20 circuit is about 12 GiB. In
-practice the per-principal tier limits bind first, but a deployment serving large
-circuits should lower `STEALTHSNARK_MAX_SESSIONS` to match its memory. The startup
-log gives the body half of this equation and not the session half, which is a
-known gap.
+The session count cap is the loose one: 64 sessions of a 2^20 circuit is about
+12 GiB. `STEALTHSNARK_MAX_RESIDENT_BYTES` (default 8 GiB) bounds the bytes instead.
+`insert` sums the resident bytes under the write lock and refuses a setup that
+would go above the budget with `session_limit`. The startup log prints both
+`max_resident_mib` and `peak_body_mib`.
 
 ## 16. Invariants a change must not break
 

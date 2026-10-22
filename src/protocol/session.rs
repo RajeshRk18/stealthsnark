@@ -160,6 +160,7 @@ pub struct SessionStore {
     inner: RwLock<HashMap<String, Arc<Session>>>,
     epoch: Instant,
     max_sessions: usize,
+    max_resident_bytes: usize,
     ttl: Duration,
     max_age: Duration,
     /// Counted separately, because an operator debugging a session that vanished
@@ -169,11 +170,17 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
-    pub fn new(max_sessions: usize, ttl: Duration, max_age: Duration) -> Self {
+    pub fn new(
+        max_sessions: usize,
+        max_resident_bytes: usize,
+        ttl: Duration,
+        max_age: Duration,
+    ) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
             epoch: Instant::now(),
             max_sessions,
+            max_resident_bytes,
             ttl,
             max_age,
             evicted_idle: AtomicU64::new(0),
@@ -185,11 +192,25 @@ impl SessionStore {
         self.epoch.elapsed().as_millis() as u64
     }
 
-    /// Store generators and return `(token, label)`.
+    #[cfg(test)]
     pub fn insert(
         &self,
         owner: &str,
         generators: Generators,
+    ) -> Result<(String, String), ApiError> {
+        self.insert_within(owner, generators, usize::MAX)
+    }
+
+    /// Store generators for `owner` and return `(token, label)`, if `owner` holds
+    /// fewer than `owner_limit` live sessions.
+    ///
+    /// Both limits are checked under the write lock. A check before the slow
+    /// decode alone lets concurrent setups from one principal all pass it.
+    pub fn insert_within(
+        &self,
+        owner: &str,
+        generators: Generators,
+        owner_limit: usize,
     ) -> Result<(String, String), ApiError> {
         self.sweep();
 
@@ -208,7 +229,17 @@ impl SessionStore {
         });
 
         let mut map = self.write();
-        if map.len() >= self.max_sessions {
+        let held = map
+            .values()
+            .filter(|s| s.owner == owner && !self.is_expired(s, now))
+            .count();
+        if held >= owner_limit {
+            return Err(ApiError::SessionQuotaExceeded { limit: owner_limit });
+        }
+        let pinned: usize = map.values().map(|s| s.resident_bytes).sum();
+        if map.len() >= self.max_sessions
+            || pinned.saturating_add(resident_bytes) > self.max_resident_bytes
+        {
             return Err(ApiError::SessionLimit);
         }
         map.insert(token.clone(), session);
@@ -403,6 +434,7 @@ mod tests {
     fn store(max: usize, ttl_ms: u64) -> SessionStore {
         SessionStore::new(
             max,
+            usize::MAX,
             Duration::from_millis(ttl_ms),
             Duration::from_secs(3600),
         )
@@ -411,6 +443,7 @@ mod tests {
     fn store_with_max_age(max: usize, ttl_ms: u64, max_age_ms: u64) -> SessionStore {
         SessionStore::new(
             max,
+            usize::MAX,
             Duration::from_millis(ttl_ms),
             Duration::from_millis(max_age_ms),
         )
@@ -646,4 +679,44 @@ mod tests {
         s.insert("owner", g).unwrap();
         assert_eq!(s.resident_bytes(), expected);
     }
+
+    #[test]
+    fn concurrent_inserts_cannot_exceed_the_owner_limit() {
+        let s = Arc::new(store(64, 60_000));
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (s, start) = (s.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    s.insert_within("alice", tiny_generators(), 3)
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 3);
+        for e in results.iter().filter_map(|r| r.as_ref().err()) {
+            assert_eq!(e.code(), "session_quota_exceeded");
+        }
+        assert_eq!(s.count_for("alice"), 3);
+        // Another principal is not charged for alice's sessions.
+        assert!(s.insert_within("bob", tiny_generators(), 1).is_ok());
+    }
+
+
+    #[test]
+    fn the_byte_budget_binds_before_the_session_count() {
+        let points = || Generators::from_points(vec![G1Affine::identity(); 10], vec![], vec![], vec![], vec![]);
+        let one = points().resident_bytes();
+        let s = SessionStore::new(64, 2 * one, Duration::from_secs(60), Duration::from_secs(60));
+
+        s.insert("alice", points()).unwrap();
+        s.insert("bob", points()).unwrap();
+        // A third fits the count cap of 64 but not the byte budget.
+        assert_eq!(s.insert("carol", points()).unwrap_err().code(), "session_limit");
+        // Sessions with no generators pin nothing and still fit.
+        assert!(s.insert("carol", tiny_generators()).is_ok());
+    }
+
 }

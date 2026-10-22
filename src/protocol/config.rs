@@ -39,6 +39,9 @@ pub struct TlsPaths {
 /// See [`ServerConfig::peak_body_bytes`] for more.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
+/// Default budget for generator bytes pinned by all sessions together.
+pub const DEFAULT_MAX_RESIDENT_BYTES: usize = 8 * 1024 * 1024 * 1024;
+
 /// Server Configuration
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -52,6 +55,11 @@ pub struct ServerConfig {
     /// Maximum number of live sessions. Each session pins its generators in
     /// memory, so without a cap any client can grow the process without bound.
     pub max_sessions: usize,
+
+    /// Maximum generator bytes pinned by all live sessions together.
+    /// `max_sessions` limits the count, not the size, and 64 large sessions can
+    /// exhaust memory. See [`DEFAULT_MAX_RESIDENT_BYTES`].
+    pub max_resident_bytes: usize,
 
     /// Idle timeout after which a session is evicted and its generators freed.
     pub session_ttl: Duration,
@@ -81,8 +89,19 @@ pub struct ServerConfig {
     /// 503 — far kinder to a client than an eventual timeout.
     pub max_concurrent_msm: usize,
 
-    /// How long a request waits for an MSM slot before being shed with 503.
+    /// Maximum request bodies held in memory at once, from the first byte read
+    /// until the request ends. A request waits for an upload slot before its
+    /// body is read, so this, not the connection count, bounds body memory.
+    /// At least `max_concurrent_msm`, because every MSM holds its body.
+    pub max_concurrent_uploads: usize,
+
+    /// How long a request waits for an upload or MSM slot before being shed with 503.
     pub admission_wait: Duration,
+
+    /// Time a TLS connection has to send complete request headers. Without it, a
+    /// client that sends header bytes very slowly holds a connection slot for as
+    /// long as it wants, before any authentication runs.
+    pub header_read_timeout: Duration,
 
     /// Per-request wall-clock ceiling. Generous by default, because a large
     /// honest MSM legitimately takes minutes.
@@ -118,14 +137,17 @@ impl Default for ServerConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 3000)),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_sessions: 64,
+            max_resident_bytes: DEFAULT_MAX_RESIDENT_BYTES,
             session_ttl: Duration::from_secs(30 * 60),
             // Long enough that a legitimate batch of proofs finishes inside one
             // session, short enough that a token is not indefinite.
             session_max_age: Duration::from_secs(12 * 60 * 60),
             sweep_interval: Duration::from_secs(60),
             max_concurrent_msm: default_concurrency(),
+            max_concurrent_uploads: 2 * default_concurrency(),
             admission_wait: Duration::from_secs(30),
             request_timeout: Duration::from_secs(600),
+            header_read_timeout: Duration::from_secs(10),
             // Off by default so that `cargo run --bin server` still works on a
             // developer machine. It is safe only because `validate` refuses this
             // combination on any non-loopback bind address.
@@ -157,12 +179,21 @@ impl ServerConfig {
             bind_addr: env_or("STEALTHSNARK_BIND", d.bind_addr)?,
             max_body_bytes: env_or("STEALTHSNARK_MAX_BODY_BYTES", d.max_body_bytes)?,
             max_sessions: env_or("STEALTHSNARK_MAX_SESSIONS", d.max_sessions)?,
+            max_resident_bytes: env_or("STEALTHSNARK_MAX_RESIDENT_BYTES", d.max_resident_bytes)?,
             session_ttl: env_secs("STEALTHSNARK_SESSION_TTL_SECS", d.session_ttl)?,
             session_max_age: env_secs("STEALTHSNARK_SESSION_MAX_AGE_SECS", d.session_max_age)?,
             sweep_interval: env_secs("STEALTHSNARK_SWEEP_INTERVAL_SECS", d.sweep_interval)?,
             max_concurrent_msm: env_or("STEALTHSNARK_MAX_CONCURRENT_MSM", d.max_concurrent_msm)?,
+            max_concurrent_uploads: env_or(
+                "STEALTHSNARK_MAX_CONCURRENT_UPLOADS",
+                d.max_concurrent_uploads,
+            )?,
             admission_wait: env_secs("STEALTHSNARK_ADMISSION_WAIT_SECS", d.admission_wait)?,
             request_timeout: env_secs("STEALTHSNARK_REQUEST_TIMEOUT_SECS", d.request_timeout)?,
+            header_read_timeout: env_secs(
+                "STEALTHSNARK_HEADER_READ_TIMEOUT_SECS",
+                d.header_read_timeout,
+            )?,
             auth_mode: env_or("STEALTHSNARK_AUTH", d.auth_mode)?,
             auth_file: env_path("STEALTHSNARK_AUTH_FILE")?,
             tls: tls_from_env()?,
@@ -179,8 +210,18 @@ impl ServerConfig {
         if self.max_concurrent_msm == 0 {
             anyhow::bail!("STEALTHSNARK_MAX_CONCURRENT_MSM must be >= 1");
         }
+        if self.max_concurrent_uploads < self.max_concurrent_msm {
+            anyhow::bail!(
+                "STEALTHSNARK_MAX_CONCURRENT_UPLOADS ({}) must be >= STEALTHSNARK_MAX_CONCURRENT_MSM ({})",
+                self.max_concurrent_uploads,
+                self.max_concurrent_msm
+            );
+        }
         if self.max_sessions == 0 {
             anyhow::bail!("STEALTHSNARK_MAX_SESSIONS must be >= 1");
+        }
+        if self.max_resident_bytes == 0 {
+            anyhow::bail!("STEALTHSNARK_MAX_RESIDENT_BYTES must be >= 1");
         }
         if self.max_body_bytes == 0 {
             anyhow::bail!("STEALTHSNARK_MAX_BODY_BYTES must be >= 1");
@@ -200,6 +241,9 @@ impl ServerConfig {
                 self.session_max_age.as_secs(),
                 self.session_ttl.as_secs()
             );
+        }
+        if self.header_read_timeout.is_zero() {
+            anyhow::bail!("STEALTHSNARK_HEADER_READ_TIMEOUT_SECS must be >= 1");
         }
         if self.quota_bucket_idle.is_zero() {
             anyhow::bail!("STEALTHSNARK_QUOTA_BUCKET_IDLE_SECS must be >= 1");
@@ -246,18 +290,19 @@ impl ServerConfig {
             anyhow::bail!("TLS is configured but this binary was built without the `tls` feature");
         }
 
-        if self.bind_addr == self.admin_bind_addr {
+        // Same port, and the same or a wildcard address, is the same socket.
+        let (data, admin) = (self.bind_addr, self.admin_bind_addr);
+        if data.port() == admin.port()
+            && (data.ip() == admin.ip() || data.ip().is_unspecified() || admin.ip().is_unspecified())
+        {
             anyhow::bail!(
                 "STEALTHSNARK_BIND and STEALTHSNARK_ADMIN_BIND must differ. \
                  The admin plane is unauthenticated and must not share the data port"
             );
         }
-        if !self.admin_bind_addr.ip().is_loopback() {
-            anyhow::bail!(
-                "refusing to expose the admin plane on {}. /metrics reports internal state",
-                self.admin_bind_addr
-            );
-        }
+        // A non-loopback admin bind is allowed when the operator sets it: a load
+        // balancer or a probe from another host cannot reach loopback. `serve`
+        // logs a warning, because `/metrics` then leaves the host.
         Ok(())
     }
 
@@ -275,10 +320,16 @@ impl ServerConfig {
         }
     }
 
-    /// Returns worst-case resident bytes from requests at maximum available throughput. 
+    /// Worst-case bytes held by requests in flight: every upload slot full, plus
+    /// the decoded points of every MSM slot running a setup. A decoded G1 point is
+    /// 72 bytes against 32 compressed (G2: 136 against 64), so about 9/4 of the body.
     /// Logged at startup so an operator sees the memory envelope they just configured.
     pub fn peak_body_bytes(&self) -> usize {
-        self.max_body_bytes.saturating_mul(self.max_concurrent_msm)
+        let bodies = self.max_body_bytes.saturating_mul(self.max_concurrent_uploads);
+        let decoded = (self.max_body_bytes / 4)
+            .saturating_mul(9)
+            .saturating_mul(self.max_concurrent_msm);
+        bodies.saturating_add(decoded)
     }
 }
 
@@ -516,12 +567,19 @@ mod tests {
         let err = shared.validate().unwrap_err();
         assert!(err.to_string().contains("must differ"), "{err}");
 
+        let wildcard_same_port = ServerConfig {
+            admin_bind_addr: "0.0.0.0:3000".parse().unwrap(),
+            ..ServerConfig::default()
+        };
+        let err = wildcard_same_port.validate().unwrap_err();
+        assert!(err.to_string().contains("must differ"), "{err}");
+
+        // An explicit non-loopback admin bind starts, so probes can reach it.
         let exposed = ServerConfig {
             admin_bind_addr: "0.0.0.0:3001".parse().unwrap(),
             ..ServerConfig::default()
         };
-        let err = exposed.validate().unwrap_err();
-        assert!(err.to_string().contains("admin plane"), "{err}");
+        assert!(exposed.validate().is_ok());
     }
 
     #[test]

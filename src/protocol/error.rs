@@ -33,6 +33,9 @@ pub enum ApiError {
     #[error("session quota exceeded: this client may hold at most {limit} sessions")]
     SessionQuotaExceeded { limit: usize },
 
+    #[error("this client already has {limit} setup or prove requests in progress")]
+    InflightLimit { limit: usize },
+
     #[error("request body exceeds the {limit_bytes} byte limit for this client")]
     BodyTooLarge { limit_bytes: u64 },
 
@@ -48,7 +51,7 @@ pub enum ApiError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
 
-    #[error("too many active sessions; retry later or release an existing session")]
+    #[error("server session capacity (count or memory) is full; retry later or release an existing session")]
     SessionLimit,
 
     #[error("server at capacity, retry shortly")]
@@ -56,6 +59,10 @@ pub enum ApiError {
 
     #[error("server is shutting down")]
     ShuttingDown,
+
+    /// The request ran longer than `STEALTHSNARK_REQUEST_TIMEOUT_SECS`.
+    #[error("request timed out; the server may still be computing it, do not retry at once")]
+    Timeout,
 
     /// The detail is logged server-side and never sent to the caller.
     #[error("internal server error")]
@@ -73,6 +80,7 @@ impl ApiError {
             Self::Forbidden(_) => "forbidden",
             Self::RateLimited { .. } => "rate_limited",
             Self::SessionQuotaExceeded { .. } => "session_quota_exceeded",
+            Self::InflightLimit { .. } => "inflight_limit",
             Self::BodyTooLarge { .. } => "body_too_large",
             Self::MissingToken => "missing_token",
             Self::UnknownSession => "unknown_session",
@@ -80,6 +88,7 @@ impl ApiError {
             Self::SessionLimit => "session_limit",
             Self::Overloaded => "overloaded",
             Self::ShuttingDown => "shutting_down",
+            Self::Timeout => "timeout",
             Self::Internal(_) => "internal",
         }
     }
@@ -98,10 +107,12 @@ impl ApiError {
             // Retrying unchanged cannot help, which is why it is not a 401.
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::BodyTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::SessionLimit | Self::RateLimited { .. } | Self::SessionQuotaExceeded { .. } => {
-                StatusCode::TOO_MANY_REQUESTS
-            }
+            Self::SessionLimit
+            | Self::RateLimited { .. }
+            | Self::SessionQuotaExceeded { .. }
+            | Self::InflightLimit { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::Overloaded | Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -117,6 +128,7 @@ impl ApiError {
                 | Self::SessionLimit
                 | Self::RateLimited { .. }
                 | Self::SessionQuotaExceeded { .. }
+                | Self::InflightLimit { .. }
         )
     }
 
@@ -125,6 +137,7 @@ impl ApiError {
         match self {
             Self::RateLimited { retry_after_secs } => Some(*retry_after_secs),
             Self::Overloaded | Self::SessionLimit | Self::SessionQuotaExceeded { .. } => Some(5),
+            Self::InflightLimit { .. } => Some(1),
             _ => None,
         }
     }
@@ -181,6 +194,7 @@ pub(crate) mod tests {
                 retry_after_secs: 7,
             },
             ApiError::SessionQuotaExceeded { limit: 4 },
+            ApiError::InflightLimit { limit: 2 },
             ApiError::BodyTooLarge { limit_bytes: 10 },
             ApiError::MissingToken,
             ApiError::UnknownSession,
@@ -188,6 +202,7 @@ pub(crate) mod tests {
             ApiError::SessionLimit,
             ApiError::Overloaded,
             ApiError::ShuttingDown,
+            ApiError::Timeout,
             ApiError::Internal(String::new()),
         ]
     }

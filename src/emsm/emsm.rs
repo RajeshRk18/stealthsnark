@@ -17,15 +17,12 @@ pub struct EmsmPublicParams<G: CurveGroup> {
     pub t: usize,
 }
 
-/// Preprocessed commitments h = G^T * g.
+/// Preprocessed commitments h = G^T * g, with h[i] = sum over j of G^T[i][j] * generators[j].
 /// These are computed once during setup and stored by the client.
 /// Used during decryption to remove the noise contribution.
 #[derive(Clone, Debug)]
 pub struct PreprocessedCommitments<G: CurveGroup> {
-    /// h[i] = sum over j of G^T[i][j] * generators[j]
-    /// Stored as projective points for efficient sparse MSM later.
-    pub h: Vec<G>,
-    /// Pedersen instance over preprocessed generators
+    /// Pedersen instance over the preprocessed generators h, in affine form.
     pub pedersen_h: Pedersen<G>,
 }
 
@@ -49,10 +46,10 @@ impl<G: CurveGroup> EmsmPublicParams<G> {
             .t_operator
             .multiply_transpose_group::<G>(&self.generators);
 
-        let h_affine: Vec<G::Affine> = h.iter().map(|p| p.into_affine()).collect();
-        let pedersen_h = Pedersen::from_generators(h_affine);
+        // One field inversion for the whole batch instead of one per point.
+        let pedersen_h = Pedersen::from_generators(G::normalize_batch(&h));
 
-        PreprocessedCommitments { h, pedersen_h }
+        PreprocessedCommitments { pedersen_h }
     }
 
     /// Computes MSM(masked_scalars, generators).

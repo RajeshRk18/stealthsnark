@@ -3,8 +3,8 @@
 //!
 //! A request carries two credentials used in different stage:
 //!
-//!     - API Key or TLS client certificate which is helpful to identify "who am i"
-//!     - Session token to identify the short lived session owned by that identity bearer(server identifies the user's generators sent via `/v1/setup`)
+//! - API Key or TLS client certificate which is helpful to identify "who am i"
+//! - Session token to identify the short lived session owned by that identity bearer(server identifies the user's generators sent via `/v1/setup`)
 //!
 //! The layers are deliberately separate. A session records the principal that
 //! created it, so a stolen session token is useless without that principal's
@@ -25,6 +25,10 @@ pub const API_KEY_PREFIX: &str = "ssk";
 
 const KEY_ID_BYTES: usize = 8; // 16 hex characters
 const KEY_SECRET_BYTES: usize = 32; // 64 hex characters, 256 bits
+
+/// Compared against when the key id is unknown. No SHA-256 output is all zeros
+/// in practice, so it never matches.
+const UNKNOWN_KEY_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Which credentials the server accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +93,10 @@ pub struct Tier {
     pub name: String,
     /// Concurrent sessions this principal may hold.
     pub max_sessions: usize,
+    /// Setup and prove requests this principal may have in progress at once.
+    /// The global MSM slots are shared, so without this one principal can hold
+    /// all of them.
+    pub max_inflight: usize,
     /// Largest request body this principal may upload.
     pub max_body_bytes: usize,
     /// Sustained request rate, requests per second.
@@ -103,6 +111,7 @@ impl Tier {
         Self {
             name: "default".to_string(),
             max_sessions: 4,
+            max_inflight: DEFAULT_MAX_INFLIGHT,
             max_body_bytes: super::config::DEFAULT_MAX_BODY_BYTES,
             requests_per_sec: 2.0,
             burst: 10,
@@ -124,6 +133,7 @@ impl Tier {
         Self {
             name: "unlimited".to_string(),
             max_sessions: usize::MAX,
+            max_inflight: usize::MAX,
             max_body_bytes: usize::MAX,
             requests_per_sec: f64::from(u32::MAX),
             burst: u32::MAX,
@@ -205,15 +215,16 @@ impl AuthStore {
     }
 
     pub fn principal_count(&self) -> usize {
-        let mut ids: Vec<&str> = self
-            .by_key_id
+        self.principal_ids().len()
+    }
+
+    /// Every principal that has at least one credential.
+    pub fn principal_ids(&self) -> std::collections::BTreeSet<&str> {
+        self.by_key_id
             .values()
             .chain(self.by_cert_digest.values())
             .map(|r| r.principal_id.as_str())
-            .collect();
-        ids.sort_unstable();
-        ids.dedup();
-        ids.len()
+            .collect()
     }
 
     pub fn api_key_count(&self) -> usize {
@@ -249,11 +260,15 @@ impl AuthStore {
             if t.max_body_bytes == 0 {
                 anyhow::bail!("tier {name:?}: max_body_bytes must be >= 1");
             }
+            if t.max_inflight == 0 {
+                anyhow::bail!("tier {name:?}: max_inflight must be >= 1");
+            }
             tiers.insert(
                 name.clone(),
                 Tier {
                     name,
                     max_sessions: t.max_sessions,
+                    max_inflight: t.max_inflight,
                     max_body_bytes: t.max_body_bytes,
                     requests_per_sec: t.requests_per_sec,
                     burst: t.burst,
@@ -374,13 +389,19 @@ impl AuthStore {
         // Distinguishing them would tell an attacker which key ids exist.
         let invalid = || ApiError::Unauthenticated("invalid API key".to_string());
 
-        let record = self.by_key_id.get(&key_id).ok_or_else(invalid)?;
-        let expected = record.api_key_sha256.as_deref().ok_or_else(invalid)?;
+        // Hash and compare on every path, so an unknown key id takes the same
+        // time as a wrong secret and the time does not show which ids exist.
+        let digest = sha256_hex(secret.as_bytes());
+        let record = self.by_key_id.get(&key_id);
+        let expected = record
+            .and_then(|r| r.api_key_sha256.as_deref())
+            .unwrap_or(UNKNOWN_KEY_DIGEST);
+        let matches = constant_time_eq(&digest, expected);
 
-        if !constant_time_eq(&sha256_hex(secret.as_bytes()), expected) {
-            return Err(invalid());
+        match record {
+            Some(record) if matches => Ok(self.principal_from(record, AuthMethod::ApiKey)),
+            _ => Err(invalid()),
         }
-        Ok(self.principal_from(record, AuthMethod::ApiKey))
     }
 
     fn principal_from(&self, record: &Record, method: AuthMethod) -> Principal {
@@ -443,6 +464,17 @@ pub struct TierSpec {
     pub max_body_bytes: usize,
     pub requests_per_sec: f64,
     pub burst: u32,
+    /// Optional, so auth files written before this field still load.
+    #[serde(default = "default_max_inflight")]
+    pub max_inflight: usize,
+}
+
+/// Setup or prove requests one principal may have in progress, unless its tier
+/// says otherwise.
+pub const DEFAULT_MAX_INFLIGHT: usize = 2;
+
+fn default_max_inflight() -> usize {
+    DEFAULT_MAX_INFLIGHT
 }
 
 #[derive(Debug, Deserialize)]
@@ -713,6 +745,7 @@ mod tests {
                 max_body_bytes: 1024,
                 requests_per_sec: 1.0,
                 burst: 1,
+                max_inflight: 2,
             },
         );
         tiers.insert(
@@ -722,6 +755,7 @@ mod tests {
                 max_body_bytes: 8192,
                 requests_per_sec: 50.0,
                 burst: 100,
+                max_inflight: 2,
             },
         );
         let generated = generate_api_key();

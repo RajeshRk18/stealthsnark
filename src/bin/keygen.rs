@@ -88,8 +88,8 @@ fn cert_digest_of(path: &str) -> anyhow::Result<String> {
     #[cfg(feature = "tls")]
     {
         let pem = std::fs::read(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
-        let mut reader = std::io::BufReader::new(&pem[..]);
-        let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+        use rustls_pki_types::pem::PemObject;
+        let certs: Vec<_> = rustls_pki_types::CertificateDer::pem_slice_iter(&pem)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| anyhow::anyhow!("cannot parse certificates in {path}: {e}"))?;
         let first = certs
