@@ -59,7 +59,7 @@ CLIENT                                             SERVER
                         │         ▼            ▼              │              │              │
                         │  ┌──────────────────────────┐       │              │              │
                         │  │  BLOCKING POOL           │       │              │              │
-                        │  │  bincode decode          │       │              │              │
+                        │  │  postcard decode         │       │              │              │
                         │  │  point decode (subgroup) │       │              │              │
                         │  │  Pedersen::commit x5     │       │              │              │
                         │  │  (rayon inside each)     │       │              │              │
@@ -180,7 +180,6 @@ Throughput is flat across the bounds while per request increases. This may be be
 
 ## Limitations and future TODOs
 
-- Move from bincode. Use postcard or something.
 - Certificate identity is pinned by digest. mTLS identifies a client by the SHA-256 of its certificate, so a renewed certificate is a new identity and must be re-registered.
 - API keys live forever. Removing a record from the auth file revokes a key but it needs a restart. There is no online revocation and no expiry.
 - Currently, user's quota is per process. Rate-limit and session counts live in memory, so it is fine for a single-server instance we have now. This can be a todo to demonstrate shared state in a distributed architecture if we implement multiple servers or clusters support.

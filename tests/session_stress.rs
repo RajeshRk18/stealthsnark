@@ -114,7 +114,7 @@ async fn concurrent_sessions_stay_isolated() {
 
             // A plausible-looking but never-issued token.
             let forged = format!("{:064x}", i);
-            let body = bincode::serialize(&prove_request(&req)).unwrap();
+            let body = stealthsnark::protocol::messages::wire_encode(&prove_request(&req)).unwrap();
             let resp = reqwest::Client::new()
                 .post(format!("{url}/v1/prove"))
                 .header(

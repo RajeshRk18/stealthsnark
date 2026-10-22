@@ -28,7 +28,7 @@ fn generators_body(n: usize, seed: u64) -> Vec<u8> {
     let g1: Vec<G1Affine> = (0..n).map(|_| G1::rand(&mut rng).into_affine()).collect();
     let g2: Vec<G2Affine> = Vec::new();
     let req = SetupRequest::encode(&g1, &g1, &g1, &g1, &g2).unwrap();
-    bincode::serialize(&req).unwrap()
+    stealthsnark::protocol::messages::wire_encode(&req).unwrap()
 }
 
 fn client() -> reqwest::Client {
@@ -106,13 +106,9 @@ async fn setup_rejects_payload_above_configured_limit() {
 async fn forged_and_missing_tokens_are_refused() {
     let (url, _state) = spawn_server().await;
 
-    let prove_body = bincode::serialize(&ProveRequest {
-        v_h: ark_vec_to_bytes::<ark_bn254::Fr>(&[]).unwrap(),
-        v_l: ark_vec_to_bytes::<ark_bn254::Fr>(&[]).unwrap(),
-        v_a: ark_vec_to_bytes::<ark_bn254::Fr>(&[]).unwrap(),
-        v_b_g1: ark_vec_to_bytes::<ark_bn254::Fr>(&[]).unwrap(),
-        v_b_g2: ark_vec_to_bytes::<ark_bn254::Fr>(&[]).unwrap(),
-    })
+    let prove_body = stealthsnark::protocol::messages::wire_encode(
+        &ProveRequest::encode::<ark_bn254::Fr>(&[], &[], &[], &[], &[]).unwrap(),
+    )
     .unwrap();
 
     // No Authorization header at all.
@@ -153,7 +149,7 @@ async fn concurrent_setups_do_not_clobber_each_other() {
         )
         .await;
         assert!(resp.status().is_success());
-        let parsed: SetupResponse = bincode::deserialize(&resp.bytes().await.unwrap()).unwrap();
+        let parsed: SetupResponse = stealthsnark::protocol::messages::wire_decode(&resp.bytes().await.unwrap()).unwrap();
         assert_eq!(parsed.session_token.len(), 64, "expected 256 bits of hex");
         tokens.push(parsed.session_token);
     }
@@ -187,7 +183,7 @@ async fn expired_sessions_are_refused_and_freed() {
         Some(&PROTOCOL_VERSION.to_string()),
     )
     .await;
-    let parsed: SetupResponse = bincode::deserialize(&resp.bytes().await.unwrap()).unwrap();
+    let parsed: SetupResponse = stealthsnark::protocol::messages::wire_decode(&resp.bytes().await.unwrap()).unwrap();
     assert!(state.sessions.get(&parsed.session_token).is_some());
 
     tokio::time::sleep(Duration::from_millis(120)).await;
@@ -241,7 +237,7 @@ async fn session_cap_is_enforced() {
 // Protocol versioning and error reporting
 // ---------------------------------------------------------------------------
 
-/// bincode is not self-describing, so a shape change would otherwise decode as
+/// postcard is not self-describing, so a shape change would otherwise decode as
 /// garbage rather than failing. The version header turns that into a clean 400.
 #[tokio::test]
 async fn version_header_is_required_and_enforced() {
@@ -264,18 +260,18 @@ async fn version_header_is_required_and_enforced() {
 async fn failure_modes_are_distinguishable() {
     let (url, _state) = spawn_server().await;
 
-    // Corrupt bincode framing.
+    // Corrupt postcard framing.
     let resp = post_setup(&url, vec![0xff; 64], Some(&PROTOCOL_VERSION.to_string())).await;
     assert_eq!(resp.status().as_u16(), 400);
     assert_eq!(error_code(resp).await, "malformed_body");
 
     // Valid framing, but the point blobs are not decodable curve points.
-    let bad_points = bincode::serialize(&SetupRequest {
-        h_generators: vec![0xAA; 128],
-        l_generators: vec![0xAA; 128],
-        a_generators: vec![0xAA; 128],
-        b_g1_generators: vec![0xAA; 128],
-        b_g2_generators: vec![0xAA; 128],
+    let bad_points = stealthsnark::protocol::messages::wire_encode(&SetupRequest {
+        h_generators: vec![0xAA; 128].into(),
+        l_generators: vec![0xAA; 128].into(),
+        a_generators: vec![0xAA; 128].into(),
+        b_g1_generators: vec![0xAA; 128].into(),
+        b_g2_generators: vec![0xAA; 128].into(),
     })
     .unwrap();
     let resp = post_setup(&url, bad_points, Some(&PROTOCOL_VERSION.to_string())).await;
@@ -295,17 +291,17 @@ async fn length_mismatch_is_reported_as_invalid_input() {
         Some(&PROTOCOL_VERSION.to_string()),
     )
     .await;
-    let parsed: SetupResponse = bincode::deserialize(&resp.bytes().await.unwrap()).unwrap();
+    let parsed: SetupResponse = stealthsnark::protocol::messages::wire_decode(&resp.bytes().await.unwrap()).unwrap();
 
     // 8 generators were registered; send 3 scalars.
     let scalars: Vec<ark_bn254::Fr> = (0..3).map(ark_bn254::Fr::from).collect();
     let empty = ark_vec_to_bytes::<ark_bn254::Fr>(&[]).unwrap();
-    let body = bincode::serialize(&ProveRequest {
-        v_h: ark_vec_to_bytes(&scalars).unwrap(),
-        v_l: empty.clone(),
-        v_a: empty.clone(),
-        v_b_g1: empty.clone(),
-        v_b_g2: empty,
+    let body = stealthsnark::protocol::messages::wire_encode(&ProveRequest {
+        v_h: ark_vec_to_bytes(&scalars).unwrap().into(),
+        v_l: empty.clone().into(),
+        v_a: empty.clone().into(),
+        v_b_g1: empty.clone().into(),
+        v_b_g2: empty.into(),
     })
     .unwrap();
 
@@ -335,7 +331,7 @@ async fn release_frees_the_session_and_invalidates_the_token() {
         Some(&PROTOCOL_VERSION.to_string()),
     )
     .await;
-    let parsed: SetupResponse = bincode::deserialize(&resp.bytes().await.unwrap()).unwrap();
+    let parsed: SetupResponse = stealthsnark::protocol::messages::wire_decode(&resp.bytes().await.unwrap()).unwrap();
     assert!(state.sessions.resident_bytes() > 0);
 
     let resp = client()

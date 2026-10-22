@@ -1,8 +1,10 @@
+use std::borrow::Cow;
+
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use serde::{Deserialize, Serialize};
 
 /// Wire protocol version, sent in the [`VERSION_HEADER`] on every `/v1` request.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Header carrying [`PROTOCOL_VERSION`].
 pub const VERSION_HEADER: &str = "x-stealthsnark-version";
@@ -24,6 +26,22 @@ const MAX_VEC_LEN: u64 = 1 << 24;
 /// `size_of::<T>()` (~136x for G2Affine). 
 /// Beyond this bound, the Vec grows amortized, which is negligible compared to deserialization.
 const MAX_PREALLOC_ELEMS: usize = 1024;
+
+/// Encode a message body. postcard is not self-describing, so the version header
+/// is what keeps a changed message shape from decoding as something else.
+pub fn wire_encode<T: Serialize>(value: &T) -> Result<Vec<u8>, anyhow::Error> {
+    postcard::to_allocvec(value).map_err(|e| anyhow::anyhow!("encode failed: {e}"))
+}
+
+/// Decode a message body. Bytes after the message are an error, not ignored.
+pub fn wire_decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, anyhow::Error> {
+    let (value, rest) =
+        postcard::take_from_bytes(bytes).map_err(|e| anyhow::anyhow!("decode failed: {e}"))?;
+    if !rest.is_empty() {
+        anyhow::bail!("{} trailing bytes after the message", rest.len());
+    }
+    Ok(value)
+}
 
 /// Serialize an arkworks type to bytes.
 pub fn ark_to_bytes<T: CanonicalSerialize>(val: &T) -> Result<Vec<u8>, anyhow::Error> {
@@ -96,16 +114,24 @@ pub struct ReleaseAllResponse {
 }
 
 /// Setup request: generator points for each of the 5 MSMs.
+///
+/// The fields borrow from the request body when decoded, so the server does not
+/// copy hundreds of MiB of points before it parses them.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SetupRequest {
-    pub h_generators: Vec<u8>,
-    pub l_generators: Vec<u8>,
-    pub a_generators: Vec<u8>,
-    pub b_g1_generators: Vec<u8>,
-    pub b_g2_generators: Vec<u8>,
+pub struct SetupRequest<'a> {
+    #[serde(borrow)]
+    pub h_generators: Cow<'a, [u8]>,
+    #[serde(borrow)]
+    pub l_generators: Cow<'a, [u8]>,
+    #[serde(borrow)]
+    pub a_generators: Cow<'a, [u8]>,
+    #[serde(borrow)]
+    pub b_g1_generators: Cow<'a, [u8]>,
+    #[serde(borrow)]
+    pub b_g2_generators: Cow<'a, [u8]>,
 }
 
-impl SetupRequest {
+impl SetupRequest<'static> {
     /// Encode the five generator sets.
     ///
     /// Exists so that the fallibility introduced by [`ark_vec_to_bytes`] is
@@ -122,26 +148,31 @@ impl SetupRequest {
         P2: CanonicalSerialize,
     {
         Ok(Self {
-            h_generators: ark_vec_to_bytes(h)?,
-            l_generators: ark_vec_to_bytes(l)?,
-            a_generators: ark_vec_to_bytes(a)?,
-            b_g1_generators: ark_vec_to_bytes(b_g1)?,
-            b_g2_generators: ark_vec_to_bytes(b_g2)?,
+            h_generators: ark_vec_to_bytes(h)?.into(),
+            l_generators: ark_vec_to_bytes(l)?.into(),
+            a_generators: ark_vec_to_bytes(a)?.into(),
+            b_g1_generators: ark_vec_to_bytes(b_g1)?.into(),
+            b_g2_generators: ark_vec_to_bytes(b_g2)?.into(),
         })
     }
 }
 
-/// Prove request: 5 masked scalar vectors.
+/// Prove request: 5 masked scalar vectors. Borrows from the body when decoded.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ProveRequest {
-    pub v_h: Vec<u8>,
-    pub v_l: Vec<u8>,
-    pub v_a: Vec<u8>,
-    pub v_b_g1: Vec<u8>,
-    pub v_b_g2: Vec<u8>,
+pub struct ProveRequest<'a> {
+    #[serde(borrow)]
+    pub v_h: Cow<'a, [u8]>,
+    #[serde(borrow)]
+    pub v_l: Cow<'a, [u8]>,
+    #[serde(borrow)]
+    pub v_a: Cow<'a, [u8]>,
+    #[serde(borrow)]
+    pub v_b_g1: Cow<'a, [u8]>,
+    #[serde(borrow)]
+    pub v_b_g2: Cow<'a, [u8]>,
 }
 
-impl ProveRequest {
+impl ProveRequest<'static> {
     /// Encode the five masked scalar vectors.
     pub fn encode<F: CanonicalSerialize>(
         v_h: &[F],
@@ -151,11 +182,11 @@ impl ProveRequest {
         v_b_g2: &[F],
     ) -> Result<Self, anyhow::Error> {
         Ok(Self {
-            v_h: ark_vec_to_bytes(v_h)?,
-            v_l: ark_vec_to_bytes(v_l)?,
-            v_a: ark_vec_to_bytes(v_a)?,
-            v_b_g1: ark_vec_to_bytes(v_b_g1)?,
-            v_b_g2: ark_vec_to_bytes(v_b_g2)?,
+            v_h: ark_vec_to_bytes(v_h)?.into(),
+            v_l: ark_vec_to_bytes(v_l)?.into(),
+            v_a: ark_vec_to_bytes(v_a)?.into(),
+            v_b_g1: ark_vec_to_bytes(v_b_g1)?.into(),
+            v_b_g2: ark_vec_to_bytes(v_b_g2)?.into(),
         })
     }
 }
@@ -230,4 +261,20 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
     }
+
+    #[test]
+    fn decoded_requests_borrow_the_body() {
+        let bytes = wire_encode(&ProveRequest::encode::<Fr>(&[], &[], &[], &[], &[]).unwrap()).unwrap();
+        let req: ProveRequest = wire_decode(&bytes).unwrap();
+        assert!(matches!(req.v_h, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn trailing_bytes_are_refused() {
+        let mut bytes = wire_encode(&ReleaseAllResponse { released: 2 }).unwrap();
+        assert_eq!(wire_decode::<ReleaseAllResponse>(&bytes).unwrap().released, 2);
+        bytes.push(0);
+        assert!(wire_decode::<ReleaseAllResponse>(&bytes).is_err());
+    }
+
 }

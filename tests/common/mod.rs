@@ -108,7 +108,7 @@ pub fn tier(
     t
 }
 
-pub fn setup_request(sapk: &ServerAidedProvingKey) -> SetupRequest {
+pub fn setup_request(sapk: &ServerAidedProvingKey) -> SetupRequest<'static> {
     SetupRequest::encode::<G1Affine, G2Affine>(
         &sapk.emsm_h.generators,
         &sapk.emsm_l.generators,
@@ -119,7 +119,7 @@ pub fn setup_request(sapk: &ServerAidedProvingKey) -> SetupRequest {
     .expect("encoding generators must not fail")
 }
 
-pub fn prove_request(req: &EncryptedRequest) -> ProveRequest {
+pub fn prove_request(req: &EncryptedRequest) -> ProveRequest<'static> {
     ProveRequest::encode(&req.v_h, &req.v_l, &req.v_a, &req.v_b_g1, &req.v_b_g2)
         .expect("encoding masked vectors must not fail")
 }

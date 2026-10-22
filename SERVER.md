@@ -5,7 +5,7 @@ Reference. For why any of it is shaped this way, see
 
 ## API
 
-Bodies are bincode over `application/octet-stream`. Errors are
+Bodies are postcard over `application/octet-stream`. Errors are
 `{"code": "...", "message": "..."}`, where `code` is stable and machine-readable.
 
 | Method | Path | Headers | Purpose |
@@ -17,7 +17,7 @@ Bodies are bincode over `application/octet-stream`. Errors are
 
 | Header | Value |
 |---|---|
-| `x-stealthsnark-version` | `2`, required on every `/v1` request |
+| `x-stealthsnark-version` | `3`, required on every `/v1` request |
 | `Authorization` | `Bearer <api key>`, omit under mTLS |
 | `x-stealthsnark-session` | the token returned by `/v1/setup` |
 

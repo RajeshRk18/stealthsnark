@@ -184,7 +184,7 @@ fn generators_body(n: usize, seed: u64) -> Vec<u8> {
     let mut rng = ChaCha20Rng::seed_from_u64(seed);
     let g1: Vec<G1Affine> = (0..n).map(|_| G1::rand(&mut rng).into_affine()).collect();
     let g2: Vec<G2Affine> = Vec::new();
-    bincode::serialize(&SetupRequest::encode(&g1, &g1, &g1, &g1, &g2).unwrap()).unwrap()
+    stealthsnark::protocol::messages::wire_encode(&SetupRequest::encode(&g1, &g1, &g1, &g1, &g2).unwrap()).unwrap()
 }
 
 fn tls_config(pki: &Pki, mode: AuthMode, with_client_ca: bool) -> ServerConfig {
@@ -486,7 +486,7 @@ async fn mtls_identity_is_bound_to_its_sessions() {
         .send()
         .await
         .unwrap();
-    let issued: SetupResponse = bincode::deserialize(&resp.bytes().await.unwrap()).unwrap();
+    let issued: SetupResponse = stealthsnark::protocol::messages::wire_decode(&resp.bytes().await.unwrap()).unwrap();
 
     // The key client presents that token.
     let key_client = reqwest::Client::builder()

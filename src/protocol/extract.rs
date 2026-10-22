@@ -154,7 +154,7 @@ impl FromRequestParts<AppState> for OwnedSession {
 
 /// Reject a caller that does not speak this protocol version.
 ///
-/// bincode is not self-describing, so a message struct that changed shape decodes
+/// postcard is not self-describing, so a message struct that changed shape decodes
 /// as something rather than failing. This turns that into a clean 400.
 pub fn require_version(headers: &HeaderMap) -> Result<(), ApiError> {
     let raw = headers
@@ -232,8 +232,9 @@ mod tests {
         assert!(missing.to_string().contains("<missing>"));
 
         // Version 1 sent the session token in Authorization, so accepting it
-        // would mean reading a session token as an API key.
-        for bad in ["1", "0", "3", "banana", ""] {
+        // would mean reading a session token as an API key. Version 2 used
+        // bincode bodies, which do not decode as postcard.
+        for bad in ["1", "2", "0", "4", "banana", ""] {
             let e = require_version(&headers(&[(VERSION_HEADER, bad)])).unwrap_err();
             assert_eq!(e.code(), "unsupported_version", "accepted version {bad:?}");
         }

@@ -13,8 +13,8 @@ use std::time::Duration;
 use anyhow::Result;
 
 use super::messages::{
-    ProveRequest, ProveResponse, ReleaseAllResponse, SetupRequest, SetupResponse, PROTOCOL_VERSION,
-    SESSION_HEADER, VERSION_HEADER,
+    wire_decode, wire_encode, ProveRequest, ProveResponse, ReleaseAllResponse, SetupRequest,
+    SetupResponse, PROTOCOL_VERSION, SESSION_HEADER, VERSION_HEADER,
 };
 
 /// Default per-request ceiling.
@@ -189,8 +189,8 @@ impl EmsmClient {
     }
 
     /// `POST /v1/setup` upload generators and store the returned token.
-    pub async fn send_setup(&mut self, request: &SetupRequest) -> Result<()> {
-        let body = bincode::serialize(request)?;
+    pub async fn send_setup(&mut self, request: &SetupRequest<'_>) -> Result<()> {
+        let body = wire_encode(request)?;
         let resp = self
             .request(reqwest::Method::POST, "/v1/setup")
             .header("Content-Type", "application/octet-stream")
@@ -199,15 +199,15 @@ impl EmsmClient {
             .await?;
 
         let bytes = read_success(resp, "setup").await?;
-        let parsed: SetupResponse = bincode::deserialize(&bytes)?;
+        let parsed: SetupResponse = wire_decode(&bytes)?;
         self.session_token = Some(parsed.session_token);
         self.session_label = Some(parsed.session_label);
         Ok(())
     }
 
     /// `POST /v1/prove` send masked vectors and receive the five MSM results.
-    pub async fn send_prove(&self, request: &ProveRequest) -> Result<ProveResponse> {
-        let body = bincode::serialize(request)?;
+    pub async fn send_prove(&self, request: &ProveRequest<'_>) -> Result<ProveResponse> {
+        let body = wire_encode(request)?;
         let resp = self
             .request(reqwest::Method::POST, "/v1/prove")
             .header("Content-Type", "application/octet-stream")
@@ -217,7 +217,7 @@ impl EmsmClient {
             .await?;
 
         let bytes = read_success(resp, "prove").await?;
-        Ok(bincode::deserialize(&bytes)?)
+        wire_decode(&bytes)
     }
 
     /// `DELETE /v1/session` free the server's copy of the generators
@@ -251,7 +251,7 @@ impl EmsmClient {
             .send()
             .await?;
         let bytes = read_success(resp, "release_all").await?;
-        let parsed: ReleaseAllResponse = bincode::deserialize(&bytes)?;
+        let parsed: ReleaseAllResponse = wire_decode(&bytes)?;
         self.forget_session();
         Ok(parsed.released)
     }

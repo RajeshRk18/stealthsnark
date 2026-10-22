@@ -43,7 +43,7 @@ src/protocol/
   server.rs     AppState, both routers, TLS accept loop, handlers, shutdown
   error.rs      ApiError, status mapping, stable machine codes
   metrics.rs    atomic counters, Prometheus text rendering
-  messages.rs   wire types, bincode helpers, protocol version and headers
+  messages.rs   wire types, postcard helpers, protocol version and headers
   secret.rs     random_hex, hex, sha256_hex, constant_time_eq
   tls.rs        rustls config, client CA, certificate digests  (feature = "tls")
 src/bin/
@@ -227,7 +227,7 @@ step 2 and never touches any principal's bucket.
  ────────────────────                    ─────────────
  accept, parse headers
  auth, quota, session lookup
- acquire MSM permit  ──────spawn_blocking──► bincode decode
+ acquire MSM permit  ──────spawn_blocking──► postcard decode
                                             point decode (subgroup checks)
                                             Pedersen::commit x5  (rayon inside)
                                             serialise results
@@ -403,7 +403,7 @@ says the credential may be stale, 403 says no retry with this identity can work.
 This forced the protocol version to 2. Version 1 put the session token in
 `Authorization`, so a v1 client against a v2 server would present a session token
 where an API key is expected. The version header turns that into a clear
-rejection.
+rejection. Version 3 changed the body encoding from bincode to postcard.
 
 ### 8.1 API keys
 
@@ -536,7 +536,7 @@ Four rules behind the table:
   delay; the others use 5 seconds.
 - Distinguishability is the goal. The first version returned a bare 400 with no
   body for every failure, so a client could not tell a length mismatch from a bad
-  point encoding from corrupt bincode: three problems, three different fixes, one
+  point encoding from corrupt framing: three problems, three different fixes, one
   indistinguishable response.
 
 The client mirrors this. `classify(code)` maps every code to `client_error`,
@@ -546,23 +546,28 @@ build until the client handles it.
 
 ## 11. Wire format
 
-bincode with default configuration, `application/octet-stream`.
+postcard, `application/octet-stream`, protocol version 3. Version 2 used bincode,
+which is unmaintained (RUSTSEC-2025-0141).
 
 | Level | Layout |
 |---|---|
-| A `Vec<u8>` field | `u64` length little-endian, then the bytes |
-| Inside a field | `u64` element count, then each element compressed |
+| A byte field | varint (LEB128) length, then the bytes |
+| Inside a field | arkworks `u64` element count little-endian, then each element compressed |
 
-A minimal valid `SetupRequest` with five empty generator sets is 80 bytes: five
-fields, each an 8 byte bincode length of 8 followed by an 8 byte arkworks count of
+A minimal valid `SetupRequest` with five empty generator sets is 45 bytes: five
+fields, each a 1 byte varint length of 8 followed by an 8 byte arkworks count of
 zero.
 
 ```python
 field = struct.pack('<Q', 0)                                          # 0 elements
-body  = b''.join(struct.pack('<Q', len(field)) + field for _ in range(5))
+body  = b''.join(bytes([len(field)]) + field for _ in range(5))       # varint 8 is one byte
 ```
 
-**bincode is not self-describing.** A struct that gains a field decodes as
+`wire_decode` refuses bytes after the message, so a body cannot carry a hidden
+suffix. Request fields are `Cow<[u8]>` and borrow from the body when decoded, so
+the server does not copy the generators before it parses them.
+
+**postcard is not self-describing.** A struct that gains a field decodes as
 something rather than failing, which is silent corruption. That is the entire
 reason the version header is mandatory.
 

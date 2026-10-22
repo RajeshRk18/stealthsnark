@@ -27,7 +27,7 @@ fn generators_body(n: usize, seed: u64) -> Vec<u8> {
     let g1: Vec<G1Affine> = (0..n).map(|_| G1::rand(&mut rng).into_affine()).collect();
     let g2: Vec<G2Affine> = Vec::new();
     let req = SetupRequest::encode(&g1, &g1, &g1, &g1, &g2).unwrap();
-    bincode::serialize(&req).unwrap()
+    stealthsnark::protocol::messages::wire_encode(&req).unwrap()
 }
 
 fn http() -> reqwest::Client {
@@ -139,7 +139,7 @@ async fn a_session_token_is_useless_to_another_principal() {
     let (alice, bob) = (&keys[0].key, &keys[1].key);
 
     let resp = setup_as(&url, Some(alice), generators_body(8, 3)).await;
-    let issued: SetupResponse = bincode::deserialize(&resp.bytes().await.unwrap()).unwrap();
+    let issued: SetupResponse = stealthsnark::protocol::messages::wire_decode(&resp.bytes().await.unwrap()).unwrap();
 
     // Bob authenticates correctly but presents Alice's session token.
     let resp = raw(
@@ -267,7 +267,7 @@ async fn session_quota_is_enforced_per_principal() {
     for i in 0..2 {
         let resp = setup_as(&url, Some(alice), generators_body(4, 30 + i)).await;
         assert!(resp.status().is_success());
-        let issued: SetupResponse = bincode::deserialize(&resp.bytes().await.unwrap()).unwrap();
+        let issued: SetupResponse = stealthsnark::protocol::messages::wire_decode(&resp.bytes().await.unwrap()).unwrap();
         tokens.push(issued.session_token);
     }
 
@@ -315,7 +315,7 @@ async fn session_quota_is_enforced_per_principal() {
     .unwrap();
     assert!(resp.status().is_success());
 
-    let released: ReleaseAllResponse = bincode::deserialize(&resp.bytes().await.unwrap()).unwrap();
+    let released: ReleaseAllResponse = stealthsnark::protocol::messages::wire_decode(&resp.bytes().await.unwrap()).unwrap();
     assert_eq!(released.released, 2);
     assert_eq!(state.sessions.count_for("alice"), 0);
 

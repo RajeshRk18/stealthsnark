@@ -14,7 +14,7 @@
 //!
 //! # Data plane endpoints
 //!
-//! Bodies are bincode over `application/octet-stream`. Every request carries
+//! Bodies are postcard over `application/octet-stream`. Every request carries
 //! `x-stealthsnark-version`. `/v1/prove` and `/v1/session` also carry
 //! `x-stealthsnark-session`.
 //!
@@ -695,12 +695,11 @@ async fn handle_release_all(
 // ---------------------------------------------------------------------------
 
 fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, ApiError> {
-    bincode::serialize(value)
-        .map_err(|e| ApiError::Internal(format!("response encode failed: {e}")))
+    wire_encode(value).map_err(|e| ApiError::Internal(format!("response {e}")))
 }
 
-fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, ApiError> {
-    bincode::deserialize(bytes).map_err(|e| ApiError::MalformedBody(e.to_string()))
+fn decode<'a, T: serde::Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, ApiError> {
+    wire_decode(bytes).map_err(|e| ApiError::MalformedBody(e.to_string()))
 }
 
 // ----------------------------------------------------------------------------
