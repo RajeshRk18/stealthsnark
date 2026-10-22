@@ -16,7 +16,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # ponytail: pinned to 1.88. ark-circom 0.5 pulls wasmer-vm 4.4, which links
+      # `__rust_probestack` on x86_64; Rust 1.89 removed that symbol, so the link
+      # fails. Unpin after moving to ark-circom 0.6 (arkworks 0.6, wasmer 6).
+      - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |

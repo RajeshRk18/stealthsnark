@@ -27,7 +27,8 @@ full() {
   cargo test --all-features --locked
   # The lean core that the fuzz crate builds (no circom, no tls).
   cargo check --lib --no-default-features --locked
-  cargo check --manifest-path fuzz/Cargo.toml
+  # fuzz/Cargo.lock is not committed; resolve versions that this rustc supports.
+  CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo check --manifest-path fuzz/Cargo.toml
   cargo deny check
 }
 
