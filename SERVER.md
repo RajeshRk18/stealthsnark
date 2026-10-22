@@ -130,6 +130,7 @@ TLS path is a startup error, not a downgrade to plain HTTP.
 | `STEALTHSNARK_SESSION_MAX_AGE_SECS` | `43200` (12 h) | Absolute session lifetime, however often it is used. Must be >= the idle timeout. |
 | `STEALTHSNARK_SWEEP_INTERVAL_SECS` | `60` | How often idle sessions are reclaimed. |
 | `STEALTHSNARK_MAX_CONCURRENT_MSM` | `cores/2`, clamped to `[1,4]` | Concurrent MSM evaluations. Small on purpose: each MSM is already rayon-parallel internally. |
+| `STEALTHSNARK_MAX_CONCURRENT_UPLOADS` | `2 * MAX_CONCURRENT_MSM` | Request bodies held in memory at once. A request waits for a slot before its body is read. Must be >= `MAX_CONCURRENT_MSM`. |
 | `STEALTHSNARK_ADMISSION_WAIT_SECS` | `30` | How long a request waits for a slot before a 503. |
 | `STEALTHSNARK_REQUEST_TIMEOUT_SECS` | `600` | Per-request ceiling. |
 | `STEALTHSNARK_LOG` | `info` | `tracing` filter. |

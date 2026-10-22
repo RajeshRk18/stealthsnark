@@ -21,6 +21,7 @@ use axum::http::{header::AUTHORIZATION, HeaderMap};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::body::Bytes;
+use tokio::sync::OwnedSemaphorePermit;
 
 use super::auth::Principal;
 use super::error::ApiError;
@@ -41,7 +42,11 @@ pub struct Caller(pub Arc<Principal>);
 /// `Content-Length` check in [`authenticate`] is skipped entirely by a chunked
 /// or HTTP/2 sender that declares no length. This reads the body itself and
 /// stops at `min(tier, transport)`
-pub struct TieredBody(pub Bytes);
+///
+/// It takes an upload slot before it reads, so body memory is bounded by
+/// `max_concurrent_uploads`, not by the number of connections. Hold the permit
+/// for as long as the body is alive.
+pub struct TieredBody(pub Bytes, pub OwnedSemaphorePermit);
 
 impl FromRequest<AppState> for TieredBody {
     type Rejection = ApiError;
@@ -50,15 +55,17 @@ impl FromRequest<AppState> for TieredBody {
         let (mut parts, body) = req.into_parts();
         let Caller(principal) = Caller::from_request_parts(&mut parts, app).await?;
         let limit = principal.tier.max_body_bytes.min(app.config.max_body_bytes);
-
-        axum::body::to_bytes(body, limit)
+        let upload = app
+            .acquire_slot(&app.upload_slots)
             .await
-            .map(TieredBody)
-            .map_err(|_| {
-                app.reject(ApiError::BodyTooLarge {
-                    limit_bytes: limit as u64,
-                })
+            .map_err(|e| app.reject(e))?;
+
+        let bytes = axum::body::to_bytes(body, limit).await.map_err(|_| {
+            app.reject(ApiError::BodyTooLarge {
+                limit_bytes: limit as u64,
             })
+        })?;
+        Ok(TieredBody(bytes, upload))
     }
 }
 

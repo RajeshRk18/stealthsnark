@@ -89,7 +89,13 @@ pub struct ServerConfig {
     /// 503 — far kinder to a client than an eventual timeout.
     pub max_concurrent_msm: usize,
 
-    /// How long a request waits for an MSM slot before being shed with 503.
+    /// Maximum request bodies held in memory at once, from the first byte read
+    /// until the request ends. A request waits for an upload slot before its
+    /// body is read, so this, not the connection count, bounds body memory.
+    /// At least `max_concurrent_msm`, because every MSM holds its body.
+    pub max_concurrent_uploads: usize,
+
+    /// How long a request waits for an upload or MSM slot before being shed with 503.
     pub admission_wait: Duration,
 
     /// Per-request wall-clock ceiling. Generous by default, because a large
@@ -133,6 +139,7 @@ impl Default for ServerConfig {
             session_max_age: Duration::from_secs(12 * 60 * 60),
             sweep_interval: Duration::from_secs(60),
             max_concurrent_msm: default_concurrency(),
+            max_concurrent_uploads: 2 * default_concurrency(),
             admission_wait: Duration::from_secs(30),
             request_timeout: Duration::from_secs(600),
             // Off by default so that `cargo run --bin server` still works on a
@@ -171,6 +178,10 @@ impl ServerConfig {
             session_max_age: env_secs("STEALTHSNARK_SESSION_MAX_AGE_SECS", d.session_max_age)?,
             sweep_interval: env_secs("STEALTHSNARK_SWEEP_INTERVAL_SECS", d.sweep_interval)?,
             max_concurrent_msm: env_or("STEALTHSNARK_MAX_CONCURRENT_MSM", d.max_concurrent_msm)?,
+            max_concurrent_uploads: env_or(
+                "STEALTHSNARK_MAX_CONCURRENT_UPLOADS",
+                d.max_concurrent_uploads,
+            )?,
             admission_wait: env_secs("STEALTHSNARK_ADMISSION_WAIT_SECS", d.admission_wait)?,
             request_timeout: env_secs("STEALTHSNARK_REQUEST_TIMEOUT_SECS", d.request_timeout)?,
             auth_mode: env_or("STEALTHSNARK_AUTH", d.auth_mode)?,
@@ -188,6 +199,13 @@ impl ServerConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.max_concurrent_msm == 0 {
             anyhow::bail!("STEALTHSNARK_MAX_CONCURRENT_MSM must be >= 1");
+        }
+        if self.max_concurrent_uploads < self.max_concurrent_msm {
+            anyhow::bail!(
+                "STEALTHSNARK_MAX_CONCURRENT_UPLOADS ({}) must be >= STEALTHSNARK_MAX_CONCURRENT_MSM ({})",
+                self.max_concurrent_uploads,
+                self.max_concurrent_msm
+            );
         }
         if self.max_sessions == 0 {
             anyhow::bail!("STEALTHSNARK_MAX_SESSIONS must be >= 1");
@@ -288,10 +306,16 @@ impl ServerConfig {
         }
     }
 
-    /// Returns worst-case resident bytes from requests at maximum available throughput. 
+    /// Worst-case bytes held by requests in flight: every upload slot full, plus
+    /// the decoded points of every MSM slot running a setup. A decoded G1 point is
+    /// 72 bytes against 32 compressed (G2: 136 against 64), so about 9/4 of the body.
     /// Logged at startup so an operator sees the memory envelope they just configured.
     pub fn peak_body_bytes(&self) -> usize {
-        self.max_body_bytes.saturating_mul(self.max_concurrent_msm)
+        let bodies = self.max_body_bytes.saturating_mul(self.max_concurrent_uploads);
+        let decoded = (self.max_body_bytes / 4)
+            .saturating_mul(9)
+            .saturating_mul(self.max_concurrent_msm);
+        bodies.saturating_add(decoded)
     }
 }
 

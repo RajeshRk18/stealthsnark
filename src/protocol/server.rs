@@ -74,6 +74,9 @@ pub struct AppState {
     /// Admission control for MSM evaluation. See
     /// [`ServerConfig::max_concurrent_msm`] for why the bound is small.
     pub msm_slots: Arc<Semaphore>,
+    /// Admission control for request bodies. See
+    /// [`ServerConfig::max_concurrent_uploads`].
+    pub upload_slots: Arc<Semaphore>,
     pub shutting_down: Arc<AtomicBool>,
 }
 
@@ -93,6 +96,7 @@ impl AppState {
             config.session_max_age,
         ));
         let msm_slots = Arc::new(Semaphore::new(config.max_concurrent_msm));
+        let upload_slots = Arc::new(Semaphore::new(config.max_concurrent_uploads));
         Self {
             config: Arc::new(config),
             auth: Arc::new(auth),
@@ -100,20 +104,29 @@ impl AppState {
             sessions,
             metrics: Arc::new(Metrics::default()),
             msm_slots,
+            upload_slots,
             shutting_down: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Wait a bounded time for an MSM slot.
+    async fn acquire_msm_slot(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        self.acquire_slot(&self.msm_slots).await
+    }
+
+    /// Wait a bounded time for a permit from `slots`.
     ///
     /// Shedding with 503 and `Retry-After` beats queueing without limit: a client
     /// learns at once that it should back off, rather than after a timeout it
     /// cannot tell apart from a crash.
-    async fn acquire_msm_slot(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+    pub(crate) async fn acquire_slot(
+        &self,
+        slots: &Arc<Semaphore>,
+    ) -> Result<OwnedSemaphorePermit, ApiError> {
         if self.shutting_down.load(Ordering::Relaxed) {
             return Err(ApiError::ShuttingDown);
         }
-        let slots = self.msm_slots.clone();
+        let slots = slots.clone();
         match tokio::time::timeout(self.config.admission_wait, slots.acquire_owned()).await {
             Ok(Ok(permit)) => Ok(permit),
             // The semaphore closes only while the process tears down.
@@ -224,6 +237,7 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
         max_sessions = cfg.max_sessions,
         max_resident_mib = cfg.max_resident_bytes / (1024 * 1024),
         max_concurrent_msm = cfg.max_concurrent_msm,
+        max_concurrent_uploads = cfg.max_concurrent_uploads,
         session_ttl_secs = cfg.session_ttl.as_secs(),
         peak_body_mib = cfg.peak_body_bytes() / (1024 * 1024),
         "StealthSnark server listening"
@@ -530,7 +544,7 @@ async fn handle_setup(
     State(app): State<AppState>,
     _version: ApiVersion,
     Caller(principal): Caller,
-    TieredBody(body): TieredBody,
+    TieredBody(body, upload): TieredBody,
 ) -> Result<Bytes, ApiError> {
     // Charge the session quota before decoding, so an over-quota caller does not
     // get megabytes of point validation done for free. `insert_within` checks
@@ -549,7 +563,7 @@ async fn handle_setup(
 
     let started = Instant::now();
     let decoded = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+        let _permits = (permit, upload);
         decode_generators(&body)
     })
     .await
@@ -604,7 +618,7 @@ async fn handle_prove(
     _version: ApiVersion,
     Caller(principal): Caller,
     owned: OwnedSession,
-    TieredBody(body): TieredBody,
+    TieredBody(body, upload): TieredBody,
 ) -> Result<Bytes, ApiError> {
     let permit = app.acquire_msm_slot().await.map_err(|e| {
         app.metrics.prove_err.fetch_add(1, Ordering::Relaxed);
@@ -616,7 +630,7 @@ async fn handle_prove(
     let started = Instant::now();
 
     let computed = tokio::task::spawn_blocking(move || {
-        let _permit = permit; // released when the MSMs finish
+        let _permits = (permit, upload); // released when the MSMs finish
         evaluate_msms(&session, &body)
     })
     .await

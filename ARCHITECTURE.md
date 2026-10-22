@@ -131,9 +131,11 @@ because no missing environment variable may produce an open compute service.
 | admin bind equals data bind | the open plane would share the closed port |
 | `session_max_age < session_ttl` | the idle timeout would be unreachable |
 
-Startup logs `peak_body_mib`, which is `max_body_bytes * max_concurrent_msm`. That
+Startup logs `peak_body_mib`, which is
+`max_body_bytes * max_concurrent_uploads + 9/4 * max_body_bytes * max_concurrent_msm`:
+every upload slot full, plus the decoded points of every setup in progress. That
 product, not either factor alone, is the worst-case resident memory from in-flight
-bodies. An operator raising the body limit for a bigger circuit needs to see the
+requests. An operator raising the body limit for a bigger circuit needs to see the
 multiplication happen.
 
 ## 5. The request path
@@ -265,6 +267,14 @@ tokio::task::spawn_blocking(move || {
 
 `/v1/setup` also takes a permit although it computes no MSM, because decoding
 192 MiB of generators is minutes of the same CPU work.
+
+Bodies have their own semaphore, `upload_slots`, with `max_concurrent_uploads`
+permits (default `2 * max_concurrent_msm`). `TieredBody` takes a permit before it
+reads the first byte, and the handler moves it into the blocking closure with the
+MSM permit. Without it, axum reads the body in the extractor, before the handler
+can wait for an MSM slot, so every connection could hold a full body in memory
+while it waits. A separate semaphore, not the MSM one, because a slow upload would
+otherwise hold a compute slot while it sends.
 
 ### 6.3 Lock discipline
 
@@ -672,9 +682,9 @@ never a downgrade.
 
 | Source | Worst case |
 |---|---|
-| in-flight request bodies | `max_body_bytes * max_concurrent_msm`, 256 MiB * 4 = 1 GiB |
+| in-flight request bodies | `max_body_bytes * max_concurrent_uploads`, 256 MiB * 8 = 2 GiB |
 | resident session generators | `min(max_sessions * per-session size, max_resident_bytes)` |
-| decoded working set during an MSM | roughly the generator set again, per concurrent MSM |
+| decoded points during a setup | about `9/4 * max_body_bytes` per concurrent MSM |
 | rate buckets | about 50 bytes per distinct principal, swept |
 
 The session count cap is the loose one: 64 sessions of a 2^20 circuit is about

@@ -487,3 +487,42 @@ async fn metrics_reflect_traffic() {
     );
     assert!(after.contains("stealthsnark_active_sessions 1"), "{after}");
 }
+
+/// A request waits for an upload slot before its body is read, so body memory is
+/// bounded by `max_concurrent_uploads` and not by the number of connections.
+#[tokio::test]
+async fn bodies_are_not_read_without_an_upload_slot() {
+    use tokio::io::AsyncWriteExt;
+
+    let (url, state) = spawn_server_with(ServerConfig {
+        max_concurrent_msm: 1,
+        max_concurrent_uploads: 1,
+        admission_wait: Duration::from_millis(300),
+        ..ServerConfig::default()
+    })
+    .await;
+    let addr = url.trim_start_matches("http://");
+    let version = Some(PROTOCOL_VERSION.to_string());
+
+    // A slow upload: headers and part of the body, then nothing.
+    let mut slow = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let head = format!(
+        "POST /v1/setup HTTP/1.1\r\nHost: {addr}\r\n{VERSION_HEADER}: {PROTOCOL_VERSION}\r\n\
+         Content-Type: application/octet-stream\r\nContent-Length: 1000\r\n\r\n"
+    );
+    slow.write_all(head.as_bytes()).await.unwrap();
+    slow.write_all(&[0u8; 10]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(state.upload_slots.available_permits(), 0, "the slow upload holds the slot");
+
+    let resp = post_setup(&url, generators_body(4, 31), version.as_deref()).await;
+    assert_eq!(resp.status().as_u16(), 503);
+    assert_eq!(error_code(resp).await, "overloaded");
+
+    // Closing the slow upload frees the slot.
+    drop(slow);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let resp = post_setup(&url, generators_body(4, 32), version.as_deref()).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(state.upload_slots.available_permits(), 1);
+}
