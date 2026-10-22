@@ -257,6 +257,14 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
         "StealthSnark server listening"
     );
 
+    if !admin_addr.ip().is_loopback() {
+        tracing::warn!(
+            %admin_addr,
+            "the admin plane is not on loopback; /livez, /readyz and /metrics need no \
+             credential, so restrict this address with a firewall or network policy"
+        );
+    }
+
     if !cfg.auth_mode.is_enabled() {
         // Loud because `validate` only permits this on loopback and an operator
         // who did not intend it should see it immediately.

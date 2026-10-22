@@ -290,18 +290,19 @@ impl ServerConfig {
             anyhow::bail!("TLS is configured but this binary was built without the `tls` feature");
         }
 
-        if self.bind_addr == self.admin_bind_addr {
+        // Same port, and the same or a wildcard address, is the same socket.
+        let (data, admin) = (self.bind_addr, self.admin_bind_addr);
+        if data.port() == admin.port()
+            && (data.ip() == admin.ip() || data.ip().is_unspecified() || admin.ip().is_unspecified())
+        {
             anyhow::bail!(
                 "STEALTHSNARK_BIND and STEALTHSNARK_ADMIN_BIND must differ. \
                  The admin plane is unauthenticated and must not share the data port"
             );
         }
-        if !self.admin_bind_addr.ip().is_loopback() {
-            anyhow::bail!(
-                "refusing to expose the admin plane on {}. /metrics reports internal state",
-                self.admin_bind_addr
-            );
-        }
+        // A non-loopback admin bind is allowed when the operator sets it: a load
+        // balancer or a probe from another host cannot reach loopback. `serve`
+        // logs a warning, because `/metrics` then leaves the host.
         Ok(())
     }
 
@@ -566,12 +567,19 @@ mod tests {
         let err = shared.validate().unwrap_err();
         assert!(err.to_string().contains("must differ"), "{err}");
 
+        let wildcard_same_port = ServerConfig {
+            admin_bind_addr: "0.0.0.0:3000".parse().unwrap(),
+            ..ServerConfig::default()
+        };
+        let err = wildcard_same_port.validate().unwrap_err();
+        assert!(err.to_string().contains("must differ"), "{err}");
+
+        // An explicit non-loopback admin bind starts, so probes can reach it.
         let exposed = ServerConfig {
             admin_bind_addr: "0.0.0.0:3001".parse().unwrap(),
             ..ServerConfig::default()
         };
-        let err = exposed.validate().unwrap_err();
-        assert!(err.to_string().contains("admin plane"), "{err}");
+        assert!(exposed.validate().is_ok());
     }
 
     #[test]

@@ -91,12 +91,12 @@ leave the host.
 
 On one port that needs a rule like "require a credential on every path except
 these three". That is a conditional which can be wrong without anyone noticing.
-Two ports encode the same policy structurally. `ServerConfig::validate` enforces
-both halves: startup fails if the admin address is not loopback, and fails if the
-two addresses are equal.
-
-The cost is real. `/metrics` cannot be scraped from another host without a
-sidecar or a tunnel.
+Two ports encode the same policy structurally. `ServerConfig::validate` refuses
+two addresses that are the same socket. The admin address is loopback by default.
+An operator can set a non-loopback admin address, because a load balancer, a
+Kubernetes `httpGet` probe, or a Prometheus server on another host cannot reach
+loopback. Startup then logs a warning: the admin paths need no credential, so the
+network must restrict that address.
 
 `AppState` holds seven fields, each behind an `Arc`, so the `Clone` that axum
 performs per request is seven pointer bumps. Both routers share one instance,
@@ -116,7 +116,7 @@ failing earlier is cheaper.
    nothing behind it.
 5. `serve(AppState::with_auth(config, auth))`.
 
-`validate()` refuses nine combinations. The first is the one that matters most,
+`validate()` refuses eight combinations. The first is the one that matters most,
 because no missing environment variable may produce an open compute service.
 
 | Refused | Reason |
@@ -127,8 +127,7 @@ because no missing environment variable may produce an open compute service.
 | `mtls` without a client CA | nothing to verify certificates against |
 | TLS cert without key, or key without cert | half a configuration |
 | TLS configured, binary built without the `tls` feature | would serve plain HTTP on a port believed encrypted |
-| admin bind not loopback | `/metrics` would leave the host |
-| admin bind equals data bind | the open plane would share the closed port |
+| admin bind is the data bind socket (same port, same or wildcard address) | the open plane would share the closed port |
 | `session_max_age < session_ttl` | the idle timeout would be unreachable |
 
 Startup logs `peak_body_mib`, which is

@@ -118,7 +118,7 @@ TLS path is a startup error, not a downgrade to plain HTTP.
 | Variable | Default | Purpose |
 |---|---|---|
 | `STEALTHSNARK_BIND` | `127.0.0.1:3000` | Data-plane bind address. Loopback by default so an unauthenticated service is not exposed by accident. |
-| `STEALTHSNARK_ADMIN_BIND` | `127.0.0.1:3001` | Admin plane. Startup fails if this is not loopback. |
+| `STEALTHSNARK_ADMIN_BIND` | `127.0.0.1:3001` | Admin plane. A non-loopback address starts with a warning: the admin paths need no credential, so restrict the address with a firewall or network policy. |
 | `STEALTHSNARK_AUTH` | `disabled` | `disabled`, `apikey`, `mtls`, or `any`. |
 | `STEALTHSNARK_AUTH_FILE` | none | JSON credential file. Required unless auth is disabled. |
 | `STEALTHSNARK_TLS_CERT` / `_KEY` | none | Server certificate chain and private key. Must be set together. |
@@ -147,6 +147,6 @@ Server startup refuses these mis-configs:
 - authentication disabled on a non-loopback bind address.
 - authentication enabled with no auth file.
 - `mtls` without TLS
-- an admin bind that is not loopback, or equal to the data bind.
+- an admin bind that is the same socket as the data bind.
 - a TLS certificate without its key.
 - TLS configured in a binary built without the `tls` feature.
