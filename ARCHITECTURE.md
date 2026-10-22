@@ -668,15 +668,15 @@ never a downgrade.
 | Source | Worst case |
 |---|---|
 | in-flight request bodies | `max_body_bytes * max_concurrent_msm`, 256 MiB * 4 = 1 GiB |
-| resident session generators | `max_sessions * per-session size` |
+| resident session generators | `min(max_sessions * per-session size, max_resident_bytes)` |
 | decoded working set during an MSM | roughly the generator set again, per concurrent MSM |
 | rate buckets | about 50 bytes per distinct principal, swept |
 
-The session cap is the loose one. 64 sessions of a 2^20 circuit is about 12 GiB. In
-practice the per-principal tier limits bind first, but a deployment serving large
-circuits should lower `STEALTHSNARK_MAX_SESSIONS` to match its memory. The startup
-log gives the body half of this equation and not the session half, which is a
-known gap.
+The session count cap is the loose one: 64 sessions of a 2^20 circuit is about
+12 GiB. `STEALTHSNARK_MAX_RESIDENT_BYTES` (default 8 GiB) bounds the bytes instead.
+`insert` sums the resident bytes under the write lock and refuses a setup that
+would go above the budget with `session_limit`. The startup log prints both
+`max_resident_mib` and `peak_body_mib`.
 
 ## 16. Invariants a change must not break
 

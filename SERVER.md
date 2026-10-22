@@ -125,6 +125,7 @@ TLS path is a startup error, not a downgrade to plain HTTP.
 | `STEALTHSNARK_QUOTA_BUCKET_IDLE_SECS` | `600` | When an idle rate-limit bucket is forgotten. |
 | `STEALTHSNARK_MAX_BODY_BYTES` | `268435456` (256 MiB) | Largest request body. **This is what decides the largest servable circuit**, see below. |
 | `STEALTHSNARK_MAX_SESSIONS` | `64` | Cap on live sessions; each pins its generators in memory. |
+| `STEALTHSNARK_MAX_RESIDENT_BYTES` | `8589934592` (8 GiB) | Cap on generator bytes pinned by all sessions together. A setup above it gets `session_limit`. Set it below the host's memory. |
 | `STEALTHSNARK_SESSION_TTL_SECS` | `1800` | Idle timeout before a session is evicted. |
 | `STEALTHSNARK_SESSION_MAX_AGE_SECS` | `43200` (12 h) | Absolute session lifetime, however often it is used. Must be >= the idle timeout. |
 | `STEALTHSNARK_SWEEP_INTERVAL_SECS` | `60` | How often idle sessions are reclaimed. |

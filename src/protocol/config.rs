@@ -39,6 +39,9 @@ pub struct TlsPaths {
 /// See [`ServerConfig::peak_body_bytes`] for more.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
+/// Default budget for generator bytes pinned by all sessions together.
+pub const DEFAULT_MAX_RESIDENT_BYTES: usize = 8 * 1024 * 1024 * 1024;
+
 /// Server Configuration
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -52,6 +55,11 @@ pub struct ServerConfig {
     /// Maximum number of live sessions. Each session pins its generators in
     /// memory, so without a cap any client can grow the process without bound.
     pub max_sessions: usize,
+
+    /// Maximum generator bytes pinned by all live sessions together.
+    /// `max_sessions` limits the count, not the size, and 64 large sessions can
+    /// exhaust memory. See [`DEFAULT_MAX_RESIDENT_BYTES`].
+    pub max_resident_bytes: usize,
 
     /// Idle timeout after which a session is evicted and its generators freed.
     pub session_ttl: Duration,
@@ -118,6 +126,7 @@ impl Default for ServerConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 3000)),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_sessions: 64,
+            max_resident_bytes: DEFAULT_MAX_RESIDENT_BYTES,
             session_ttl: Duration::from_secs(30 * 60),
             // Long enough that a legitimate batch of proofs finishes inside one
             // session, short enough that a token is not indefinite.
@@ -157,6 +166,7 @@ impl ServerConfig {
             bind_addr: env_or("STEALTHSNARK_BIND", d.bind_addr)?,
             max_body_bytes: env_or("STEALTHSNARK_MAX_BODY_BYTES", d.max_body_bytes)?,
             max_sessions: env_or("STEALTHSNARK_MAX_SESSIONS", d.max_sessions)?,
+            max_resident_bytes: env_or("STEALTHSNARK_MAX_RESIDENT_BYTES", d.max_resident_bytes)?,
             session_ttl: env_secs("STEALTHSNARK_SESSION_TTL_SECS", d.session_ttl)?,
             session_max_age: env_secs("STEALTHSNARK_SESSION_MAX_AGE_SECS", d.session_max_age)?,
             sweep_interval: env_secs("STEALTHSNARK_SWEEP_INTERVAL_SECS", d.sweep_interval)?,
@@ -181,6 +191,9 @@ impl ServerConfig {
         }
         if self.max_sessions == 0 {
             anyhow::bail!("STEALTHSNARK_MAX_SESSIONS must be >= 1");
+        }
+        if self.max_resident_bytes == 0 {
+            anyhow::bail!("STEALTHSNARK_MAX_RESIDENT_BYTES must be >= 1");
         }
         if self.max_body_bytes == 0 {
             anyhow::bail!("STEALTHSNARK_MAX_BODY_BYTES must be >= 1");

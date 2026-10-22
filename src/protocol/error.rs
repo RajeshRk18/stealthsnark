@@ -48,7 +48,7 @@ pub enum ApiError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
 
-    #[error("too many active sessions; retry later or release an existing session")]
+    #[error("server session capacity (count or memory) is full; retry later or release an existing session")]
     SessionLimit,
 
     #[error("server at capacity, retry shortly")]

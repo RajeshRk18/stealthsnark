@@ -88,6 +88,7 @@ impl AppState {
     pub fn with_auth(config: ServerConfig, auth: AuthStore) -> Self {
         let sessions = Arc::new(SessionStore::new(
             config.max_sessions,
+            config.max_resident_bytes,
             config.session_ttl,
             config.session_max_age,
         ));
@@ -221,6 +222,7 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
         client_certs = state.auth.client_cert_count(),
         max_body_mib = cfg.max_body_bytes / (1024 * 1024),
         max_sessions = cfg.max_sessions,
+        max_resident_mib = cfg.max_resident_bytes / (1024 * 1024),
         max_concurrent_msm = cfg.max_concurrent_msm,
         session_ttl_secs = cfg.session_ttl.as_secs(),
         peak_body_mib = cfg.peak_body_bytes() / (1024 * 1024),
