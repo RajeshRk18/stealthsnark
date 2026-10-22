@@ -611,3 +611,27 @@ async fn tls_shutdown_answers_requests_in_progress_before_returning() {
         .expect("serve_tls must return once the last connection closes");
     result.unwrap().unwrap();
 }
+
+/// The server speaks TLS 1.3 only. reqwest compiles rustls with TLS 1.2, so a
+/// client limited to 1.2 can be built here.
+#[tokio::test]
+async fn a_tls12_only_client_is_refused() {
+    let pki = build_pki();
+    let (url, _state) = spawn_tls(tls_config(&pki, AuthMode::Disabled, false), AuthStore::disabled()).await;
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut pki.ca_pem.as_bytes()) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let config = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let port = url.rsplit(':').next().unwrap();
+    let tcp = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let result = tokio_rustls::TlsConnector::from(Arc::new(config)).connect(name, tcp).await;
+    assert!(result.is_err(), "a TLS 1.2 handshake must fail");
+
+    // TLS 1.3 still works.
+    drop(raw_tls(&pki, &url).await);
+}

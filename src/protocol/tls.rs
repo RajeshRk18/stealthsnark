@@ -39,6 +39,10 @@ use super::secret::sha256_hex;
 #[derive(Clone, Debug)]
 pub struct PeerCertDigest(pub String);
 
+/// Every client is under the operator's control, so TLS 1.2 is only extra
+/// attack surface.
+const TLS13_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
+
 /// Build a rustls server configuration.
 ///
 /// `require_client_cert` maps to the two useful mTLS postures. When true, a
@@ -78,7 +82,7 @@ pub fn server_config(
             }
             .map_err(|e| anyhow::anyhow!("cannot build client certificate verifier: {e}"))?;
 
-            RustlsServerConfig::builder().with_client_cert_verifier(verifier)
+            RustlsServerConfig::builder_with_protocol_versions(TLS13_ONLY).with_client_cert_verifier(verifier)
         }
         None => {
             if require_client_cert {
@@ -86,7 +90,7 @@ pub fn server_config(
                     "auth mode mtls requires a client CA; set STEALTHSNARK_TLS_CLIENT_CA"
                 );
             }
-            RustlsServerConfig::builder().with_no_client_auth()
+            RustlsServerConfig::builder_with_protocol_versions(TLS13_ONLY).with_no_client_auth()
         }
     };
 

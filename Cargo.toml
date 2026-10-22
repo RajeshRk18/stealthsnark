@@ -67,12 +67,10 @@ tower-http = { version = "0.6", features = ["trace", "request-id", "catch-panic"
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "std",
-    "tls12",
     "logging",
 ], optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = [
     "ring",
-    "tls12",
     "logging",
 ], optional = true }
 rustls-pemfile = { version = "2", optional = true }

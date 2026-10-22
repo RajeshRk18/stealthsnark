@@ -690,6 +690,7 @@ Owning the loop means owning what `axum::serve` did for free:
 | header read timeout | `header_read_timeout`, 10 s; hyper applies it only when a timer is set, so the builder sets `TokioTimer`. Without it a client that sends header bytes slowly holds a slot for ever, before authentication runs |
 | HTTP/2 streams | 8 concurrent streams per connection (hyper default 200), keep-alive ping every 30 s |
 | ALPN | `alpn_protocols = ["h2", "http/1.1"]`, or you get HTTP/1.1 only |
+| protocol version | TLS 1.3 only; every client is under the operator's control |
 
 TLS sits behind a default-on `tls` feature so the lean core stays buildable under
 the cargo-fuzz sanitizer. With the feature off, configured TLS is a startup error,

@@ -97,6 +97,10 @@ openssl x509 -req -in client.csr -CA ca.pem -CAkey ca.key -out client.pem -days 
   -extfile <(printf "basicConstraints=CA:FALSE\nextendedKeyUsage=clientAuth")
   ```
 
+The server accepts TLS 1.3 only. Clients must support it: the demo client and
+any rustls or OpenSSL 1.1.1+ client do, but macOS `/usr/bin/curl`
+(SecureTransport) does not.
+
 Failed handshakes are logged at `warn`, with the rustls error text.
 
 The demo client reads its credentials from the environment:
